@@ -1196,3 +1196,50 @@ class DepthMultimodalLoss(nn.Module):
 
         loss_dict['total_loss'] = total.item()
         return total, loss_dict
+
+
+class DepthVideoLoss(nn.Module):
+    """深度图+视频双模态损失（无文本/图像项）。"""
+
+    def __init__(self, depth_weight: float = 1.0, video_weight: float = 1.0, rate_weight: float = 1e-4):
+        super().__init__()
+        self.depth_weight = depth_weight
+        self.video_weight = video_weight
+        self.rate_weight = rate_weight
+        self.depth_loss_fn = DepthLoss()
+        self.video_loss_fn = VideoLoss()
+
+    def forward(self, predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        device = None
+        for v in predictions.values():
+            if isinstance(v, torch.Tensor):
+                device = v.device
+                break
+        if device is None:
+            device = torch.device('cpu')
+
+        total = torch.tensor(0.0, device=device)
+        loss_dict: Dict[str, float] = {}
+
+        if 'depth_decoded' in predictions and 'depth' in targets:
+            depth_loss, depth_comps = self.depth_loss_fn(predictions['depth_decoded'], targets['depth'])
+            depth_loss = self.depth_weight * depth_loss
+            total = total + depth_loss
+            loss_dict['depth_loss'] = depth_loss.item()
+            loss_dict.update(depth_comps)
+
+        if 'video_decoded' in predictions and 'video' in targets:
+            video_loss, video_comps = self.video_loss_fn(predictions['video_decoded'], targets['video'])
+            video_loss = self.video_weight * video_loss
+            total = total + video_loss
+            loss_dict['video_loss'] = video_loss.item()
+            loss_dict.update(video_comps)
+
+        if 'rate_stats' in predictions and predictions['rate_stats']:
+            rate_penalty = sum(v for v in predictions['rate_stats'].values()) / len(predictions['rate_stats'])
+            rate_loss = self.rate_weight * rate_penalty
+            total = total + rate_loss
+            loss_dict['rate_loss'] = rate_loss.item()
+
+        loss_dict['total_loss'] = total
+        return loss_dict
