@@ -115,6 +115,7 @@ class TrainingConfig:
         self.video_use_convlstm = True  # 默认启用ConvLSTM建模时序
         self.video_output_dim = 192
         self.depth_output_dim = 128
+        self.shared_latent_dim = 128
         self.video_decoder_type = "swin"
         self.video_unet_base_channels = 64
         self.video_unet_num_down = 4

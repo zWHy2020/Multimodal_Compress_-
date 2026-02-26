@@ -60,6 +60,7 @@ def create_model(config: TrainingConfig) -> DepthVideoJSCC:
         video_hidden_dim=config.video_hidden_dim,
         video_num_frames=config.video_num_frames,
         video_output_dim=config.video_output_dim,
+        shared_latent_dim=getattr(config, 'shared_latent_dim', 128),
         channel_type=config.channel_type,
         snr_db=config.snr_db,
         power_normalization=True,
