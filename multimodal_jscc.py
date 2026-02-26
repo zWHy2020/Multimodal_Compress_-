@@ -673,3 +673,162 @@ class MultimodalJSCC(nn.Module):
             'trainable_parameters': trainable_params,
             'model_size_mb': total_params * 4 / (1024 * 1024),  # 假设float32
         }
+
+
+class DepthJSCCEncoder(nn.Module):
+    """轻量深度图编码器，将单通道深度图映射到信道潜变量。"""
+
+    def __init__(self, output_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv2d(64, output_dim, kernel_size=3, stride=1, padding=1),
+        )
+
+    def forward(self, depth_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        encoded = self.net(depth_input)
+        guide = encoded.mean(dim=(2, 3))
+        return encoded, guide
+
+
+class DepthJSCCDecoder(nn.Module):
+    """轻量深度图解码器。"""
+
+    def __init__(self, input_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(input_dim, 64, kernel_size=4, stride=2, padding=1),
+            nn.GELU(),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, 1, kernel_size=3, stride=1, padding=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, encoded: torch.Tensor, guide: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.net(encoded)
+
+
+class DepthOnlyMultimodalJSCC(nn.Module):
+    """Depth/Image/Video 三分支 JSCC（无文本接口）。"""
+
+    def __init__(
+        self,
+        img_size: Tuple[int, int] = (224, 224),
+        patch_size: int = 4,
+        img_embed_dims: List[int] = [96, 192, 384, 768],
+        img_depths: List[int] = [2, 2, 6, 2],
+        img_num_heads: List[int] = [3, 6, 12, 24],
+        img_output_dim: int = 256,
+        depth_output_dim: int = 128,
+        video_hidden_dim: int = 256,
+        video_num_frames: int = 5,
+        video_output_dim: int = 256,
+        channel_type: str = "awgn",
+        snr_db: float = 10.0,
+        power_normalization: bool = True,
+    ):
+        super().__init__()
+        self.image_encoder = ImageJSCCEncoder(
+            img_size=img_size,
+            patch_size=patch_size,
+            embed_dims=img_embed_dims,
+            depths=img_depths,
+            num_heads=img_num_heads,
+            output_dim=img_output_dim,
+        )
+        self.image_decoder = ImageJSCCDecoder(
+            img_size=img_size,
+            patch_size=patch_size,
+            embed_dims=img_embed_dims,
+            depths=img_depths,
+            num_heads=img_num_heads,
+            input_dim=img_output_dim,
+            semantic_context_dim=depth_output_dim,
+        )
+        self.depth_encoder = DepthJSCCEncoder(output_dim=depth_output_dim)
+        self.depth_decoder = DepthJSCCDecoder(input_dim=depth_output_dim)
+        self.video_encoder = VideoJSCCEncoder(
+            hidden_dim=video_hidden_dim,
+            num_frames=video_num_frames,
+            output_dim=video_output_dim,
+            use_optical_flow=True,
+            use_convlstm=True,
+            img_size=img_size,
+            patch_size=patch_size,
+        )
+        self.video_decoder = VideoUNetDecoder(in_channels=video_output_dim, out_channels=3)
+        self.channel = Channel(channel_type=channel_type, snr_db=snr_db, power_normalization=power_normalization)
+
+        self.power_normalizer = nn.ModuleDict()
+        if power_normalization:
+            self.power_normalizer.update({
+                'image': nn.LayerNorm(img_output_dim),
+                'video': nn.LayerNorm(video_output_dim),
+                'depth': nn.LayerNorm(depth_output_dim),
+            })
+
+    def _norm(self, modality: str, x: torch.Tensor) -> torch.Tensor:
+        if modality not in self.power_normalizer:
+            return x
+        if modality == 'video':
+            v = x.permute(0, 1, 3, 4, 2)
+            return self.power_normalizer[modality](v).permute(0, 1, 4, 2, 3)
+        if x.dim() == 4:
+            v = x.permute(0, 2, 3, 1)
+            return self.power_normalizer[modality](v).permute(0, 3, 1, 2)
+        return self.power_normalizer[modality](x)
+
+    def forward(
+        self,
+        image_input: Optional[torch.Tensor] = None,
+        depth_input: Optional[torch.Tensor] = None,
+        video_input: Optional[torch.Tensor] = None,
+        snr_db: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        if snr_db is not None:
+            self.channel.set_snr(snr_db)
+
+        encoded, guides, out = {}, {}, {}
+
+        if image_input is not None:
+            image_encoded, image_guide = self.image_encoder(image_input)
+            encoded['image'], guides['image'] = image_encoded, image_guide
+        if depth_input is not None:
+            depth_encoded, depth_guide = self.depth_encoder(depth_input)
+            encoded['depth'], guides['depth'] = depth_encoded, depth_guide
+        if video_input is not None:
+            video_encoded, video_guide = self.video_encoder(video_input)
+            encoded['video'], guides['video'] = video_encoded, video_guide
+
+        transmitted = {}
+        for m, feat in encoded.items():
+            normed = self._norm(m, feat)
+            transmitted[m] = self.channel(normed)
+            out[f'{m}_encoded'] = feat
+            out[f'{m}_transmitted'] = transmitted[m]
+
+        if 'image' in transmitted:
+            out['image_decoded'] = self.image_decoder(
+                transmitted['image'],
+                guides['image'],
+                semantic_context=encoded.get('depth', None),
+                input_resolution=getattr(self.image_encoder, 'last_latent_resolution', None),
+                output_resolution=getattr(self.image_encoder, 'last_patch_resolution', None),
+                output_size=getattr(self.image_encoder, 'last_input_size', None),
+            )
+        if 'depth' in transmitted:
+            out['depth_decoded'] = self.depth_decoder(transmitted['depth'], guides['depth'])
+        if 'video' in transmitted:
+            out['video_decoded'] = self.video_decoder(
+                transmitted['video'],
+                guides['video'],
+                semantic_context=encoded.get('depth', None),
+                output_size=getattr(self.video_encoder, 'last_input_size', None),
+            )
+
+        out['rate_stats'] = {k: v.pow(2).mean() for k, v in encoded.items()}
+        return out
