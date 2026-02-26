@@ -1128,3 +1128,118 @@ class MultimodalLoss(nn.Module):
         loss_dict['total_loss'] = total_loss
         
         return loss_dict
+
+
+
+class DepthLoss(nn.Module):
+    """深度重建损失：L1 + 边缘一致性。"""
+
+    def __init__(self, l1_weight: float = 1.0, edge_weight: float = 0.1):
+        super().__init__()
+        self.l1_weight = l1_weight
+        self.edge_weight = edge_weight
+
+    @staticmethod
+    def _gradient_map(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        gx = x[..., :, 1:] - x[..., :, :-1]
+        gy = x[..., 1:, :] - x[..., :-1, :]
+        return gx, gy
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+        l1 = F.l1_loss(pred, target)
+        gx_p, gy_p = self._gradient_map(pred)
+        gx_t, gy_t = self._gradient_map(target)
+        edge = F.l1_loss(gx_p, gx_t) + F.l1_loss(gy_p, gy_t)
+        total = self.l1_weight * l1 + self.edge_weight * edge
+        return total, {'depth_l1_loss': l1.item(), 'depth_edge_loss': edge.item()}
+
+
+class DepthMultimodalLoss(nn.Module):
+    """Depth/Image/Video 三模态损失（无文本项）。"""
+
+    def __init__(self, image_weight: float = 1.0, video_weight: float = 1.0, depth_weight: float = 1.0, rate_weight: float = 1e-4):
+        super().__init__()
+        self.image_weight = image_weight
+        self.video_weight = video_weight
+        self.depth_weight = depth_weight
+        self.rate_weight = rate_weight
+        self.image_loss_fn = ImageLoss()
+        self.video_loss_fn = VideoLoss()
+        self.depth_loss_fn = DepthLoss()
+
+    def forward(self, predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
+        total = torch.tensor(0.0, device=next(self.parameters()).device)
+        loss_dict: Dict[str, float] = {}
+
+        if 'image_decoded' in predictions and 'image' in targets:
+            image_loss, image_comps = self.image_loss_fn(predictions['image_decoded'], targets['image'])
+            total = total + self.image_weight * image_loss
+            loss_dict['image_loss'] = (self.image_weight * image_loss).item()
+            loss_dict.update(image_comps)
+
+        if 'video_decoded' in predictions and 'video' in targets:
+            video_loss, video_comps = self.video_loss_fn(predictions['video_decoded'], targets['video'])
+            total = total + self.video_weight * video_loss
+            loss_dict['video_loss'] = (self.video_weight * video_loss).item()
+            loss_dict.update(video_comps)
+
+        if 'depth_decoded' in predictions and 'depth' in targets:
+            depth_loss, depth_comps = self.depth_loss_fn(predictions['depth_decoded'], targets['depth'])
+            total = total + self.depth_weight * depth_loss
+            loss_dict['depth_loss'] = (self.depth_weight * depth_loss).item()
+            loss_dict.update(depth_comps)
+
+        if 'rate_stats' in predictions and predictions['rate_stats']:
+            rate_penalty = sum(v for v in predictions['rate_stats'].values()) / len(predictions['rate_stats'])
+            total = total + self.rate_weight * rate_penalty
+            loss_dict['rate_loss'] = (self.rate_weight * rate_penalty).item()
+
+        loss_dict['total_loss'] = total.item()
+        return total, loss_dict
+
+
+class DepthVideoLoss(nn.Module):
+    """深度图+视频双模态损失（无文本/图像项）。"""
+
+    def __init__(self, depth_weight: float = 1.0, video_weight: float = 1.0, rate_weight: float = 1e-4):
+        super().__init__()
+        self.depth_weight = depth_weight
+        self.video_weight = video_weight
+        self.rate_weight = rate_weight
+        self.depth_loss_fn = DepthLoss()
+        self.video_loss_fn = VideoLoss()
+
+    def forward(self, predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        device = None
+        for v in predictions.values():
+            if isinstance(v, torch.Tensor):
+                device = v.device
+                break
+        if device is None:
+            device = torch.device('cpu')
+
+        total = torch.tensor(0.0, device=device)
+        loss_dict: Dict[str, float] = {}
+
+        if 'depth_decoded' in predictions and 'depth' in targets:
+            depth_loss, depth_comps = self.depth_loss_fn(predictions['depth_decoded'], targets['depth'])
+            depth_loss = self.depth_weight * depth_loss
+            total = total + depth_loss
+            loss_dict['depth_loss'] = depth_loss.item()
+            loss_dict.update(depth_comps)
+
+        if 'video_decoded' in predictions and 'video' in targets:
+            video_loss, video_comps = self.video_loss_fn(predictions['video_decoded'], targets['video'])
+            video_loss = self.video_weight * video_loss
+            total = total + video_loss
+            loss_dict['video_loss'] = video_loss.item()
+            loss_dict.update(video_comps)
+
+        if 'rate_stats' in predictions and predictions['rate_stats']:
+            rate_penalty = sum(v for v in predictions['rate_stats'].values()) / len(predictions['rate_stats'])
+            rate_loss = self.rate_weight * rate_penalty
+            total = total + rate_loss
+            loss_dict['rate_loss'] = rate_loss.item()
+
+        loss_dict['total_loss'] = total
+        return loss_dict

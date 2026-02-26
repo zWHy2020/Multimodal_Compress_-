@@ -55,6 +55,7 @@ class TrainingConfig:
         self.text_weight = 0.1  # 文本损失通常较大，降低权重
         self.image_weight = 1.0
         self.video_weight = 1.0
+        self.depth_weight = 1.0
         self.reconstruction_weight = 1.0
         self.perceptual_weight = 0.01  # 【重构】启用LPIPS感知损失以提升重建质量
         self.temporal_weight = 0.05  # 降低时序损失权重
@@ -113,6 +114,8 @@ class TrainingConfig:
         self.video_use_optical_flow = True  # 默认启用光流用于时序对齐
         self.video_use_convlstm = True  # 默认启用ConvLSTM建模时序
         self.video_output_dim = 192
+        self.depth_output_dim = 128
+        self.shared_latent_dim = 128
         self.video_decoder_type = "swin"
         self.video_unet_base_channels = 64
         self.video_unet_num_down = 4
@@ -133,6 +136,7 @@ class TrainingConfig:
         self.val_manifest = None
         self.max_text_length = 512
         self.max_video_frames = 10
+        self.max_depth_maps = 1
         self.video_clip_len = self.max_video_frames
         self.video_stride = 1
         self.video_sampling_strategy = "contiguous_clip"
@@ -234,6 +238,7 @@ class EvaluationConfig:
         self.image_size = (256, 512)
         self.max_text_length = 512
         self.max_video_frames = 10
+        self.max_depth_maps = 1
         self.video_clip_len = self.max_video_frames
         self.video_stride = 1
         self.video_sampling_strategy = "contiguous_clip"

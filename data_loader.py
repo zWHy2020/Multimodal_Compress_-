@@ -103,7 +103,7 @@ class MultimodalDataset(Dataset):
         is_train: bool = True,
         allow_missing_modalities: bool = False,
         strict_mode: bool = True,
-        required_modalities: Tuple[str, ...] = ("video", "text"),
+        required_modalities: Tuple[str, ...] = ("video", "depth"),
         normalize: bool = False,
         seed: Optional[int] = None,
     ):
@@ -134,7 +134,7 @@ class MultimodalDataset(Dataset):
             getattr(self.text_tokenizer, "pad_token_id", 0) if self.text_tokenizer is not None else 0
         )
         self.drop_count = 0
-        self.missing_counts: Dict[str, int] = {"text": 0, "image": 0, "video": 0}
+        self.missing_counts: Dict[str, int] = {"text": 0, "image": 0, "video": 0, "depth": 0}
         self.random_state = random.Random(seed)
         self.version = "v2" if any("texts" in item.get("text", {}) for item in self.data_list) else "v1"
         if self.version == "v1":
@@ -210,6 +210,15 @@ class MultimodalDataset(Dataset):
         image = Image.open(full_path).convert("RGB")
         return self._apply_image_transform(image)
 
+
+
+    def _load_depth(self, depth_path: str) -> torch.Tensor:
+        full_path = os.path.join(self.data_dir, depth_path)
+        depth = Image.open(full_path).convert("L")
+        depth = self._apply_image_transform(depth)
+        if depth.dim() == 3 and depth.size(0) != 1:
+            depth = depth[:1]
+        return depth
     def _resolve_video_sampling_strategy(self) -> str:
         if self.is_train:
             return self.video_sampling_strategy
@@ -341,6 +350,20 @@ class MultimodalDataset(Dataset):
                 sample["_dropped"] = "image_error"
                 return sample
         try:
+            depth_info = item.get("depth", {})
+            depth_path = depth_info.get("file")
+            if not depth_path:
+                raise FileNotFoundError("depth.file 为空")
+            sample["depth"] = self._load_depth(depth_path)
+            sample["valid"]["depth"] = True
+        except Exception as exc:
+            self.missing_counts["depth"] += 1
+            sample["valid"]["depth"] = False
+            if self.strict_mode and "depth" in self.required_modalities:
+                self.drop_count += 1
+                sample["_dropped"] = f"depth_error: {exc}"
+                return sample
+        try:
             video_path = item.get("video", {}).get("file")
             if not video_path:
                 raise FileNotFoundError("video.file 为空")
@@ -362,6 +385,8 @@ class MultimodalDataset(Dataset):
             if not sample["valid"].get("video", False):
                 sample["video"] = torch.zeros((self.max_video_frames, 3, *self.image_size), dtype=torch.float32)
                 sample["video_frame_mask"] = torch.zeros(self.max_video_frames, dtype=torch.float32)
+            if not sample["valid"].get("depth", False):
+                sample["depth"] = torch.zeros((1, *self.image_size), dtype=torch.float32)
             if not sample["valid"].get("text", False):
                 sample["text"] = torch.full((self.max_text_length,), self.text_pad_token_id, dtype=torch.long)
                 sample["text_attention_mask"] = torch.zeros(self.max_text_length, dtype=torch.long)
@@ -400,7 +425,7 @@ def _pad_video_tensor(video: torch.Tensor, target_h: int, target_w: int) -> torc
 def collate_multimodal_batch(
     batch: List[Optional[Dict[str, Any]]],
     allow_missing_modalities: bool = False,
-    required_modalities: Tuple[str, ...] = ("video", "text"),
+    required_modalities: Tuple[str, ...] = ("video", "depth"),
 ) -> Dict[str, Any]:
     valid_samples = [b for b in batch if b is not None and not b.get("_dropped")]
     if not valid_samples:
@@ -418,7 +443,7 @@ def collate_multimodal_batch(
     inputs: Dict[str, Any] = {}
     targets: Dict[str, Any] = {}
     metas: List[Dict[str, Any]] = [s.get("meta", {}) for s in filtered_samples]
-    valid_flags: Dict[str, List[bool]] = {"text": [], "image": [], "video": []}
+    valid_flags: Dict[str, List[bool]] = {"text": [], "image": [], "video": [], "depth": []}
 
     # 文本
     if all(s.get("text") is not None for s in filtered_samples):
@@ -439,6 +464,17 @@ def collate_multimodal_batch(
         inputs["image_input"] = images
         targets["image"] = images
         valid_flags["image"] = [s.get("valid", {}).get("image", False) for s in filtered_samples]
+
+
+    # 深度
+    if all("depth" in s for s in filtered_samples):
+        depth_tensors = [s["depth"] for s in filtered_samples]
+        max_h = max(dep.shape[1] for dep in depth_tensors)
+        max_w = max(dep.shape[2] for dep in depth_tensors)
+        depths = torch.stack([_pad_image_tensor(dep, max_h, max_w) for dep in depth_tensors])
+        inputs["depth_input"] = depths
+        targets["depth"] = depths
+        valid_flags["depth"] = [s.get("valid", {}).get("depth", False) for s in filtered_samples]
 
     # 视频
     if all("video" in s for s in filtered_samples):
@@ -483,7 +519,7 @@ class MultimodalDataLoader:
         prefetch_factor: int = 2,
         allow_missing_modalities: bool = False,
         strict_mode: bool = True,
-        required_modalities: Tuple[str, ...] = ("video", "text"),
+        required_modalities: Tuple[str, ...] = ("video", "depth"),
         normalize: bool = False,
         seed: Optional[int] = None,
     ):

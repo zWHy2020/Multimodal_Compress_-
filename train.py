@@ -25,8 +25,8 @@ import math
 from functools import partial
 
 # 导入模型和工具
-from multimodal_jscc import MultimodalJSCC
-from losses import MultimodalLoss
+from multimodal_jscc import DepthVideoJSCC
+from losses import DepthVideoLoss
 from metrics import calculate_multimodal_metrics
 from data_loader import MultimodalDataLoader, MultimodalDataset, collate_multimodal_batch
 
@@ -36,7 +36,7 @@ from utils import AverageMeter, seed_torch, logger_configuration, makedirs, load
 from utils_check import print_model_structure_info, check_state_dict_compatibility
 
 
-def create_model(config: TrainingConfig) -> MultimodalJSCC:
+def create_model(config: TrainingConfig) -> DepthVideoJSCC:
     #if getattr(config, 'pretrained', False):
         #if 'swin_tiny' in config.pretrained_model_name:
             #standard_dims = [96, 192, 384, 768]
@@ -52,99 +52,33 @@ def create_model(config: TrainingConfig) -> MultimodalJSCC:
             #if config.img_depths != standard_depths:
                 #print(f"正在强制修正 config.img_depths 为 {standard_depths} 以匹配预训练模型。")
                 #config.img_depths = standard_depths
-    """创建多模态JSCC模型"""
-    model = MultimodalJSCC(
-        vocab_size=config.vocab_size,
-        text_embed_dim=config.text_embed_dim,
-        text_num_heads=config.text_num_heads,
-        text_num_layers=config.text_num_layers,
-        text_output_dim=config.text_output_dim,
+    """创建深度图+视频双模态JSCC模型"""
+    model = DepthVideoJSCC(
         img_size=config.img_size,
         patch_size=config.patch_size,
-        img_embed_dims=config.img_embed_dims,
-        img_depths=config.img_depths,
-        img_num_heads=config.img_num_heads,
-        img_output_dim=config.img_output_dim,
-        img_window_size=getattr(config, 'img_window_size', 7),
-        pretrained=getattr(config, 'pretrained', False), # 【Phase 1】预训练权重
-        freeze_encoder=getattr(config, 'freeze_encoder', False),  # 【Phase 1】冻结编码器
-        pretrained_model_name=getattr(config, 'pretrained_model_name', 'swin_tiny_patch4_window7_224'),
-        image_decoder_type=getattr(config, "image_decoder_type", "baseline"),
-        generator_type=getattr(config, "generator_type", "vae"),
-        generator_ckpt=getattr(config, "generator_ckpt", None),
-        z_channels=getattr(config, "z_channels", 4),
-        latent_down=getattr(config, "latent_down", 8),
+        depth_output_dim=getattr(config, 'depth_output_dim', 128),
         video_hidden_dim=config.video_hidden_dim,
         video_num_frames=config.video_num_frames,
-        video_use_optical_flow=config.video_use_optical_flow,
-        video_use_convlstm=config.video_use_convlstm,
         video_output_dim=config.video_output_dim,
-        video_gop_size=getattr(config, "video_gop_size", None),
-        video_latent_downsample_factor=getattr(
-            config,
-            "video_latent_downsample_factor",
-            getattr(config, "video_latent_downsample_stride", 2),
-        ),
-        video_entropy_max_exact_quantile_elems=getattr(
-            config, "video_entropy_max_exact_quantile_elems", 2_000_000
-        ),
-        video_entropy_quantile_sample_size=getattr(
-            config, "video_entropy_quantile_sample_size", 262_144
-        ),
-        video_decoder_type=getattr(config, "video_decoder_type", "unet"),
-        video_unet_base_channels=getattr(config, "video_unet_base_channels", 64),
-        video_unet_num_down=getattr(config, "video_unet_num_down", 4),
-        video_unet_num_res_blocks=getattr(config, "video_unet_num_res_blocks", 2),
-        video_decode_chunk_size=getattr(config, "video_decode_chunk_size", None),
+        shared_latent_dim=getattr(config, 'shared_latent_dim', 128),
         channel_type=config.channel_type,
         snr_db=config.snr_db,
-        use_quantization_noise=getattr(config, 'use_quantization_noise', False),
-        quantization_noise_range=getattr(config, 'quantization_noise_range', 0.5),
-        normalize_inputs=getattr(config, "normalize", False),
-        use_text_guidance_image=getattr(config, "use_text_guidance_image", False),
-        use_text_guidance_video=getattr(config, "use_text_guidance_video", False),
-        enforce_text_condition=getattr(config, "enforce_text_condition", True),
-        condition_margin_weight=getattr(config, "condition_margin_weight", 0.0),
-        condition_margin=getattr(config, "condition_margin", 0.05),
-        condition_prob=getattr(config, "condition_prob", 0.0),
-        condition_only_low_snr=getattr(config, "condition_only_low_snr", False),
-        condition_low_snr_threshold=getattr(config, "condition_low_snr_threshold", 5.0),
-        use_gradient_checkpointing=getattr(config, "use_gradient_checkpointing", True),
+        power_normalization=True,
     )
     return model
 
 
-def create_loss_fn(config: TrainingConfig) -> MultimodalLoss:
+def create_loss_fn(config: TrainingConfig) -> DepthVideoLoss:
     """创建损失函数"""
-    gan_weight = getattr(config, 'gan_weight', getattr(config, 'discriminator_weight', 0.01))
-    loss_fn = MultimodalLoss(
-        text_weight=config.text_weight,
-        image_weight=config.image_weight,
+    loss_fn = DepthVideoLoss(
+        depth_weight=getattr(config, 'depth_weight', 1.0),
         video_weight=config.video_weight,
-        image_decoder_type=getattr(config, "image_decoder_type", "baseline"),
-        reconstruction_weight=config.reconstruction_weight,
-        perceptual_weight=config.perceptual_weight,
-        temporal_weight=config.temporal_weight,
-        video_perceptual_weight=getattr(config, "video_perceptual_weight", 0.0),
-        temporal_perceptual_weight=getattr(config, "temporal_perceptual_weight", 0.0),
-        color_consistency_weight=getattr(config, "color_consistency_weight", 0.0),
-        text_contrastive_weight=getattr(config, 'text_contrastive_weight', 0.1),  # 【新增】文本对比损失权重
-        video_text_contrastive_weight=getattr(config, 'video_text_contrastive_weight', 0.05),  # 【新增】视频-文本对比损失权重
-        rate_weight=getattr(config, 'rate_weight', 1e-4),  # 【新增】码率/能量约束权重
-        temporal_consistency_weight=getattr(config, 'temporal_consistency_weight', 0.02),  # 【新增】视频时序一致性正则权重
-        gan_weight=gan_weight,  # 【Phase 6】对抗损失权重
-        use_adversarial=getattr(config, 'use_adversarial', False),  # 【Phase 3】是否使用对抗训练
-        condition_margin_weight=getattr(config, "condition_margin_weight", 0.0),
-        condition_margin=getattr(config, "condition_margin", 0.05),
-        generative_gamma1=getattr(config, "generative_gamma1", 1.0),
-        generative_gamma2=getattr(config, "generative_gamma2", 0.1),
-        normalize=getattr(config, "normalize", False),
-        data_range=1.0
+        rate_weight=getattr(config, 'rate_weight', 1e-4),
     )
     return loss_fn
 
 
-def create_optimizer(model: MultimodalJSCC, config: TrainingConfig):
+def create_optimizer(model: DepthVideoJSCC, config: TrainingConfig):
     """创建优化器"""
     optimizer = optim.Adam(
         model.parameters(),
@@ -278,7 +212,7 @@ def _compute_r1_penalty(d_out: torch.Tensor, real_input: torch.Tensor) -> torch.
 
 
 def train_one_epoch(
-    model: MultimodalJSCC,
+    model: DepthVideoJSCC,
     train_loader: DataLoader,
     loss_fn: MultimodalLoss,
     optimizer: optim.Optimizer,
@@ -301,8 +235,7 @@ def train_one_epoch(
     # 指标记录器
     meters = {
         'loss': AverageMeter(),
-        'text_loss': AverageMeter(),
-        'image_loss': AverageMeter(),
+        'depth_loss': AverageMeter(),
         'video_loss': AverageMeter(),
         'image_recon_loss': AverageMeter(),
         'image_percep_loss': AverageMeter(),
@@ -362,19 +295,11 @@ def train_one_epoch(
         # batch格式: {'inputs': {...}, 'targets': {...}, 'attention_mask': ...}
         inputs = batch['inputs']
         targets = batch['targets']
-        attention_mask = batch.get('attention_mask', None)
-        
-        # 提取各模态输入
-        text_input = inputs.get('text_input', None)
-        image_input = inputs.get('image_input', None)
+        depth_input = inputs.get('depth_input', None)
         video_input = inputs.get('video_input', None)
-        
-        # 移动到设备
-        if text_input is not None:
-            text_input = text_input.to(device, non_blocking=True)
-            attention_mask = attention_mask.to(device, non_blocking=True) if attention_mask is not None else None
-        if image_input is not None:
-            image_input = image_input.to(device, non_blocking=True)
+
+        if depth_input is not None:
+            depth_input = depth_input.to(device, non_blocking=True)
         if video_input is not None:
             video_input = video_input.to(device, non_blocking=True)
         
@@ -401,10 +326,8 @@ def train_one_epoch(
         use_amp = config.use_amp and device.type == "cuda"
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             results = model(
-                text_input=text_input,
-                image_input=image_input,
+                depth_input=depth_input,
                 video_input=video_input,
-                text_attention_mask=attention_mask,
                 snr_db=snr_db
             )
             for key, value in results.items():
@@ -437,42 +360,8 @@ def train_one_epoch(
                 for p in discriminator.parameters():
                     p.requires_grad = True
             
-            # 条件边际约束：对同一传输特征使用打乱文本解码，强制文本条件有效
-            condition_enabled = (
-                getattr(config, "enforce_text_condition", False)
-                and getattr(config, "condition_margin_weight", 0.0) > 0
-                and results.get("video_transmitted") is not None
-                and results.get("video_guide") is not None
-                and results.get("text_encoded") is not None
-                and results.get("video_decoded") is not None
-                and results["text_encoded"].shape[0] > 1
-                and (not getattr(config, "condition_only_low_snr", False) or snr_db <= getattr(config, "condition_low_snr_threshold", 5.0))
-                and np.random.rand() < getattr(config, "condition_prob", 0.0)
-            )
-            if condition_enabled:
-                with torch.no_grad():
-                    shuffle_idx = torch.randperm(results["text_encoded"].shape[0], device=device)
-                shuffled_context = results["text_encoded"][shuffle_idx]
-                # 使用相同的传输特征+guide进行第二次解码
-                shuffled_video = real_model.video_decoder(
-                    results["video_transmitted"],
-                    results["video_guide"],
-                    semantic_context=shuffled_context,
-                    reset_state=True,
-                )
-                results["video_decoded_shuffled"] = shuffled_video
-                if getattr(real_model.video_decoder, "last_semantic_gate_stats", None):
-                    stats = real_model.video_decoder.last_semantic_gate_stats
-                    results["video_semantic_gate_mean_shuffled"] = stats.get("mean")
-                    results["video_semantic_gate_std_shuffled"] = stats.get("std")
-
             # 计算损失
-            loss_dict = loss_fn(
-                predictions=results,
-                targets=device_targets,
-                attention_mask=attention_mask,
-                discriminator_outputs=discriminator_outputs  # 【Phase 3】传递判别器输出
-            )
+            loss_dict = loss_fn(results, device_targets)
             for key, value in loss_dict.items():
                 _log_nonfinite_tensor(
                     logger=logger,
@@ -680,10 +569,8 @@ def train_one_epoch(
                 f'SNR {snr_db:.2f} dB'
             )
             
-            if text_input is not None and meters['text_loss'].count > 0:
-                log_msg += f' | TextLoss {meters["text_loss"].avg:.4f}'
-            if image_input is not None and meters['image_loss'].count > 0:
-                log_msg += f' | ImageLoss {meters["image_loss"].avg:.4f}'
+            if depth_input is not None and meters['depth_loss'].count > 0:
+                log_msg += f' | DepthLoss {meters["depth_loss"].avg:.4f}'
             if video_input is not None and meters['video_loss'].count > 0:
                 log_msg += f' | VideoLoss {meters["video_loss"].avg:.4f}'
             if meters['adversarial_loss'].count > 0:
@@ -696,7 +583,7 @@ def train_one_epoch(
             logger.info(log_msg)
             
             # 清空部分指标（保留平均值）
-            for key in ['loss', 'text_loss', 'image_loss', 'video_loss']:
+            for key in ['loss', 'depth_loss', 'video_loss']:
                 if key in meters:
                     meters[key].clear()
         #if text_input is not None:
@@ -717,7 +604,7 @@ def train_one_epoch(
 
 
 def validate(
-    model: MultimodalJSCC,
+    model: DepthVideoJSCC,
     val_loader: DataLoader,
     loss_fn: MultimodalLoss,
     config: TrainingConfig,
@@ -743,8 +630,7 @@ def validate(
     # 指标记录器
     meters = {
         'loss': AverageMeter(),
-        'text_loss': AverageMeter(),
-        'image_loss': AverageMeter(),
+        'depth_loss': AverageMeter(),
         'video_loss': AverageMeter(),
         'image_psnr': AverageMeter(),
         'time': AverageMeter()
@@ -761,13 +647,9 @@ def validate(
             start_time = time.time()
             inputs = batch['inputs']
             targets = batch['targets']
-            attention_mask = batch.get('attention_mask', None)
-            text_input = inputs.get('text_input', None)
-            image_input = inputs.get('image_input', None)
+            depth_input = inputs.get('depth_input', None)
             video_input = inputs.get('video_input', None)
-            if text_input is not None: text_input = text_input.to(device, non_blocking=True)
-            if attention_mask is not None: attention_mask = attention_mask.to(device, non_blocking=True)
-            if image_input is not None: image_input = image_input.to(device, non_blocking=True)
+            if depth_input is not None: depth_input = depth_input.to(device, non_blocking=True)
             if video_input is not None: video_input = video_input.to(device, non_blocking=True)
             device_targets = {}
             for key, value in targets.items():
@@ -776,24 +658,14 @@ def validate(
             use_amp = config.use_amp and device.type == "cuda"
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 results = model(
-                    text_input=text_input,
-                    image_input=image_input,
+                    depth_input=depth_input,
                     video_input=video_input,
-                    text_attention_mask=attention_mask,
                     snr_db=snr_db
                 )
-                loss_dict = loss_fn(results, device_targets, attention_mask)
+                loss_dict = loss_fn(results, device_targets)
             meters['loss'].update(loss_dict['total_loss'].item())
-            if 'text_loss' in loss_dict: meters['text_loss'].update(loss_dict['text_loss'])
-            if 'image_loss' in loss_dict: meters['image_loss'].update(loss_dict['image_loss'])
+            if 'depth_loss' in loss_dict: meters['depth_loss'].update(loss_dict['depth_loss'])
             if 'video_loss' in loss_dict: meters['video_loss'].update(loss_dict['video_loss'])
-            if 'image_decoded' in results and 'image' in device_targets:
-                batch_psnr = calculate_multimodal_metrics(
-                    {'image_decoded': results['image_decoded']},
-                    {'image': device_targets['image']},
-                    imagenet_normalized=getattr(config, "normalize", False),
-                ).get('image_psnr', 0.0)
-                meters['image_psnr'].update(batch_psnr, n=inputs['image_input'].size(0))
             meters['time'].update(time.time() - start_time)
             del results, loss_dict, device_targets
 
