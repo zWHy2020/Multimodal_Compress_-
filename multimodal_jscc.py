@@ -66,6 +66,102 @@ class BandwidthMask(nn.Module):
         return features * mask
 
 
+class ConditionalBandwidthGate(nn.Module):
+    """
+    条件带宽控制器：使用 (SNR, 带宽比例) 生成 FiLM 风格缩放系数，再执行可选前缀稀疏化。
+
+    说明：
+    1) 这里的 gamma(c_ch) 对应报告中的可控调制项，提升“可控性”；
+    2) 前缀截断仍保留为工程近似，不宣称语义最优排序。
+    """
+
+    def __init__(self, channels: int, hidden_dim: int = 32, ratio: float = 1.0):
+        super().__init__()
+        self.channels = channels
+        self.ratio = float(ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, channels),
+        )
+
+    def set_ratio(self, ratio: float) -> None:
+        self.ratio = float(ratio)
+
+    def forward(self, features: torch.Tensor, snr_db: float, ratio: Optional[float] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if features is None:
+            return features, {}
+        ratio_v = self.ratio if ratio is None else float(ratio)
+        ratio_v = max(0.0, min(1.0, ratio_v))
+
+        cond = features.new_tensor([[float(snr_db), ratio_v]])
+        gamma = torch.sigmoid(self.mlp(cond)).view(1, 1, self.channels, 1, 1)
+
+        if features.dim() != 5:
+            # 仅对视频特征 [B,T,C,H,W] 启用条件门控，其他形状直接返回。
+            return features, {'bandwidth_gamma_mean': gamma.mean().detach()}
+
+        scaled = features * gamma
+        if ratio_v >= 1.0:
+            return scaled, {
+                'bandwidth_gamma_mean': gamma.mean().detach(),
+                'bandwidth_keep_ratio': features.new_tensor(ratio_v),
+            }
+        if ratio_v <= 0.0:
+            return torch.zeros_like(features), {
+                'bandwidth_gamma_mean': gamma.mean().detach(),
+                'bandwidth_keep_ratio': features.new_tensor(0.0),
+            }
+
+        kept = max(1, min(self.channels, int(math.ceil(self.channels * ratio_v))))
+        mask = torch.zeros(self.channels, device=features.device, dtype=features.dtype)
+        mask[:kept] = 1.0
+        masked = scaled * mask.view(1, 1, self.channels, 1, 1)
+        return masked, {
+            'bandwidth_gamma_mean': gamma.mean().detach(),
+            'bandwidth_keep_ratio': features.new_tensor(kept / max(1, self.channels)),
+        }
+
+
+class VectorQuantizer(nn.Module):
+    """轻量 VQ 瓶颈：输出离散索引并统计经验熵（bit/element）。"""
+
+    def __init__(self, dim: int, codebook_size: int = 256, commitment_cost: float = 0.25):
+        super().__init__()
+        self.dim = dim
+        self.codebook_size = codebook_size
+        self.commitment_cost = commitment_cost
+        self.codebook = nn.Embedding(codebook_size, dim)
+        nn.init.uniform_(self.codebook.weight, -1.0 / codebook_size, 1.0 / codebook_size)
+
+    @staticmethod
+    def _empirical_entropy_bits(indices: torch.Tensor, codebook_size: int) -> torch.Tensor:
+        counts = torch.bincount(indices.reshape(-1), minlength=codebook_size).float()
+        probs = counts / counts.sum().clamp_min(1.0)
+        nz = probs > 0
+        entropy = -(probs[nz] * torch.log2(probs[nz])).sum()
+        return entropy
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # 输入 [B,T,C,H,W]，按最后通道做向量量化。
+        flat = x.permute(0, 1, 3, 4, 2).reshape(-1, self.dim)
+        distances = (
+            flat.pow(2).sum(dim=1, keepdim=True)
+            - 2 * flat @ self.codebook.weight.t()
+            + self.codebook.weight.pow(2).sum(dim=1).unsqueeze(0)
+        )
+        indices = torch.argmin(distances, dim=1)
+        quantized = self.codebook(indices).view(*x.permute(0, 1, 3, 4, 2).shape)
+        quantized = quantized.permute(0, 1, 4, 2, 3).contiguous()
+
+        codebook_loss = F.mse_loss(quantized.detach(), x)
+        commitment_loss = F.mse_loss(quantized, x.detach())
+        vq_loss = codebook_loss + self.commitment_cost * commitment_loss
+        quantized = x + (quantized - x).detach()
+        entropy_bits = self._empirical_entropy_bits(indices, self.codebook_size).to(x.device)
+        return quantized, indices, vq_loss, entropy_bits
+
+
 class MultimodalJSCC(nn.Module):
     """
     多模态联合信源信道编码模型
@@ -136,6 +232,11 @@ class MultimodalJSCC(nn.Module):
         condition_only_low_snr: bool = True,
         condition_low_snr_threshold: float = 5.0,
         use_gradient_checkpointing: bool = True,
+        use_conditional_bandwidth_control: bool = True,
+        bandwidth_condition_hidden: int = 32,
+        enable_vq_bottleneck: bool = False,
+        vq_codebook_size: int = 256,
+        vq_commitment_cost: float = 0.25,
         
         # 训练参数
     ):
@@ -292,6 +393,18 @@ class MultimodalJSCC(nn.Module):
         self.condition_low_snr_threshold = condition_low_snr_threshold
         self.bandwidth_ratio = 1.0
         self.bandwidth_mask = BandwidthMask(self.bandwidth_ratio)
+        self.use_conditional_bandwidth_control = use_conditional_bandwidth_control
+        self.conditional_bandwidth_gate = ConditionalBandwidthGate(
+            channels=video_output_dim,
+            hidden_dim=bandwidth_condition_hidden,
+            ratio=self.bandwidth_ratio,
+        )
+        self.enable_vq_bottleneck = enable_vq_bottleneck
+        self.vq_bottleneck = VectorQuantizer(
+            dim=video_output_dim,
+            codebook_size=vq_codebook_size,
+            commitment_cost=vq_commitment_cost,
+        ) if enable_vq_bottleneck else None
         
         # 功率归一化模块（可选）
         # 始终创建属性以便在评估/推理阶段安全访问
@@ -394,7 +507,22 @@ class MultimodalJSCC(nn.Module):
         # 视频编码
         if video_input is not None:
             video_encoded, video_guide = self.video_encoder(video_input, snr_db=snr_db)
-            video_encoded = self.bandwidth_mask(video_encoded)
+            # 说明：条件门控先执行 gamma(c_ch) 缩放，再执行可选前缀稀疏化。
+            # 这样保留了带宽比率控制接口，同时引入对信道状态(SNR)的可控条件化能力。
+            gate_stats = {}
+            if self.use_conditional_bandwidth_control:
+                video_encoded, gate_stats = self.conditional_bandwidth_gate(video_encoded, snr_db=snr_db, ratio=self.bandwidth_ratio)
+            else:
+                video_encoded = self.bandwidth_mask(video_encoded)
+
+            if self.vq_bottleneck is not None:
+                # 说明：VQ 输出离散索引，可统计经验熵(bit/element)用于量化分析。
+                video_encoded, vq_indices, vq_loss, vq_entropy_bits = self.vq_bottleneck(video_encoded)
+                results['video_vq_indices'] = vq_indices
+                results['video_vq_loss'] = vq_loss
+                results['video_empirical_entropy_bits'] = vq_entropy_bits
+
+            results.update(gate_stats)
             # 验证输出维度
             #expected_video_dim = getattr(self.power_normalizer['video'], 'normalized_shape', (None,))
             #expected_video_dim = expected_video_dim[0] if isinstance(expected_video_dim, (list, tuple)) else expected_video_dim
@@ -425,10 +553,17 @@ class MultimodalJSCC(nn.Module):
             features = self._apply_quantization_noise(features)
             transmitted_features[modality] = self.channel(features)
             results[f'{modality}_transmitted'] = transmitted_features[modality]
+        # 说明：energy_rate_proxy 是能量代理，不等价于离散比特流；
+        # 若启用 VQ，则额外记录经验熵 empirical_entropy_bits 以提升“可量化性”。
         rate_stats = {
-            modality: features.pow(2).mean()
+            f'{modality}_energy_rate_proxy': features.pow(2).mean()
             for modality, features in encoded_features.items()
         }
+        if 'video_empirical_entropy_bits' in results:
+            rate_stats['video_empirical_entropy_bits'] = results['video_empirical_entropy_bits']
+            rate_stats['video_vq_upper_bound_bits'] = torch.log2(
+                torch.tensor(float(self.vq_bottleneck.codebook_size), device=results['video_empirical_entropy_bits'].device)
+            )
         if hasattr(self.video_encoder, "last_rate_stats") and self.video_encoder.last_rate_stats:
             rate_stats.update(self.video_encoder.last_rate_stats)
         results['rate_stats'] = rate_stats
@@ -573,7 +708,12 @@ class MultimodalJSCC(nn.Module):
         # 视频编码
         if video_input is not None:
             video_encoded, video_guide = self.video_encoder(video_input, snr_db=snr_db)
-            video_encoded = self.bandwidth_mask(video_encoded)
+            if self.use_conditional_bandwidth_control:
+                video_encoded, _ = self.conditional_bandwidth_gate(video_encoded, snr_db=snr_db, ratio=self.bandwidth_ratio)
+            else:
+                video_encoded = self.bandwidth_mask(video_encoded)
+            if self.vq_bottleneck is not None:
+                video_encoded, _, _, _ = self.vq_bottleneck(video_encoded)
             results['video_encoded'] = video_encoded
             results['video_guide'] = video_guide
         
@@ -652,9 +792,10 @@ class MultimodalJSCC(nn.Module):
         self.channel.set_snr(snr_db)
 
     def set_bandwidth_ratio(self, ratio: float):
-        """设置带宽门控比例"""
+        """设置带宽门控比例。"""
         self.bandwidth_ratio = float(ratio)
         self.bandwidth_mask.set_ratio(self.bandwidth_ratio)
+        self.conditional_bandwidth_gate.set_ratio(self.bandwidth_ratio)
     
     def reset_hidden_states(self):
         """重置所有隐藏状态"""
@@ -830,7 +971,7 @@ class DepthOnlyMultimodalJSCC(nn.Module):
                 output_size=getattr(self.video_encoder, 'last_input_size', None),
             )
 
-        out['rate_stats'] = {k: v.pow(2).mean() for k, v in encoded.items()}
+        out['rate_stats'] = {f'{k}_energy_rate_proxy': v.pow(2).mean() for k, v in encoded.items()}
         return out
 
 

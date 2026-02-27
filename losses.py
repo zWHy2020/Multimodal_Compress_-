@@ -1089,13 +1089,25 @@ class MultimodalLoss(nn.Module):
         if self.rate_weight > 0 and 'rate_stats' in predictions:
             rate_loss = None
             try:
-                for value in predictions['rate_stats'].values():
-                    if isinstance(value, torch.Tensor):
-                        rate_loss = value if rate_loss is None else (rate_loss + value)
+                # 说明：优先聚合以 "_bits" 结尾的离散熵代理；若不存在则回退到 energy_rate_proxy。
+                # 这样可避免把“能量代理”和“离散码率代理”混为同一统计口径。
+                bit_terms = []
+                energy_terms = []
+                for key, value in predictions['rate_stats'].items():
+                    if not isinstance(value, torch.Tensor):
+                        continue
+                    if key.endswith('_bits') or 'bpe' in key:
+                        bit_terms.append(value)
+                    elif 'energy_rate_proxy' in key:
+                        energy_terms.append(value)
+                selected_terms = bit_terms if bit_terms else energy_terms
+                for value in selected_terms:
+                    rate_loss = value if rate_loss is None else (rate_loss + value)
                 if rate_loss is not None:
                     weighted_rate_loss = self.rate_weight * rate_loss
                     total_loss = weighted_rate_loss if total_loss is None else (total_loss + weighted_rate_loss)
                     loss_dict['rate_loss'] = weighted_rate_loss.item()
+                    loss_dict['rate_term_count'] = float(len(selected_terms))
             except Exception as e:
                 print(f"警告: 计算码率损失时出错: {e}")
                 loss_dict['rate_loss'] = 0.0
