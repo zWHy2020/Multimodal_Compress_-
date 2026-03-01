@@ -1053,6 +1053,8 @@ class DepthVideoJSCC(nn.Module):
         channel_type: str = "awgn",
         snr_db: float = 10.0,
         power_normalization: bool = True,
+        enable_omib_stats: bool = True,
+        omib_eps: float = 1e-6,
     ):
         super().__init__()
         self.depth_encoder = DepthJSCCEncoder(output_dim=depth_output_dim)
@@ -1076,6 +1078,8 @@ class DepthVideoJSCC(nn.Module):
         self.entropy_model = JointEntropyModel()
 
         self.channel = Channel(channel_type=channel_type, snr_db=snr_db, power_normalization=power_normalization)
+        self.enable_omib_stats = bool(enable_omib_stats)
+        self.omib_eps = float(omib_eps)
 
         self.power_normalizer = nn.ModuleDict()
         if power_normalization:
@@ -1153,4 +1157,27 @@ class DepthVideoJSCC(nn.Module):
             'depth_private_bpe': entropy_stats['depth_private_bpe'],
             'video_private_bpe': entropy_stats['video_private_bpe'],
         }
+
+        if self.enable_omib_stats:
+            # OMIB-like 变分统计：用私有潜变量的经验高斯参数近似 q_d/q_v，
+            # 以便在损失侧实现 KL(q||N(0,I)) 正则。
+            depth_mu = fused['depth_private'].mean(dim=(2, 3))
+            depth_var = fused['depth_private'].var(dim=(2, 3), unbiased=False).clamp_min(self.omib_eps)
+            depth_logvar = torch.log(depth_var)
+
+            video_mu = fused['video_private'].mean(dim=(1, 3, 4))
+            video_var = fused['video_private'].var(dim=(1, 3, 4), unbiased=False).clamp_min(self.omib_eps)
+            video_logvar = torch.log(video_var)
+
+            depth_kl = 0.5 * (depth_mu.pow(2) + depth_var - 1.0 - depth_logvar)
+            video_kl = 0.5 * (video_mu.pow(2) + video_var - 1.0 - video_logvar)
+
+            out['omib_stats'] = {
+                'depth_mu': depth_mu,
+                'depth_logvar': depth_logvar,
+                'video_mu': video_mu,
+                'video_logvar': video_logvar,
+                'depth_kl': depth_kl.mean(),
+                'video_kl': video_kl.mean(),
+            }
         return out

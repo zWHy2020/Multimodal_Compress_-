@@ -62,6 +62,11 @@ class TrainingConfig:
         self.text_contrastive_weight = 0.0  # 路线1默认关闭文本-图像对比
         self.video_text_contrastive_weight = 0.1  # 【新增】视频-文本对比损失权重
         self.rate_weight = 1e-4  # 【新增】码率/能量约束权重
+        # OMIB-like 约束（用于 DepthVideoLoss）
+        self.use_omib_like = True
+        self.ib_beta = 1e-4
+        self.ib_beta_min = 0.0
+        self.ib_beta_max = None
         self.temporal_consistency_weight = 0.02  # 【新增】视频时序一致性正则权重
         # 文本引导与条件约束（路线1默认）
         self.use_text_guidance_image = True
