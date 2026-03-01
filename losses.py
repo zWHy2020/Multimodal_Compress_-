@@ -1223,6 +1223,7 @@ class DepthVideoLoss(nn.Module):
         ib_beta_min: float = 0.0,
         ib_beta_max: Optional[float] = None,
         omib_eps: float = 1e-8,
+        mi_correction_weight: float = 1.0,
     ):
         super().__init__()
         self.depth_weight = depth_weight
@@ -1233,6 +1234,7 @@ class DepthVideoLoss(nn.Module):
         self.ib_beta_min = float(ib_beta_min)
         self.ib_beta_max = None if ib_beta_max is None else float(ib_beta_max)
         self.omib_eps = float(omib_eps)
+        self.mi_correction_weight = float(mi_correction_weight)
         self.depth_loss_fn = DepthLoss()
         self.video_loss_fn = VideoLoss()
 
@@ -1298,8 +1300,13 @@ class DepthVideoLoss(nn.Module):
                     + lambda_depth * rate_stats['depth_private_bpe']
                     + lambda_video * rate_stats['video_private_bpe']
                 )
+                mi_correction = None
+                if 'cross_modal_mi_bits' in rate_stats:
+                    mi_correction = self.mi_correction_weight * rate_stats['cross_modal_mi_bits']
+                    rate_penalty = rate_penalty - mi_correction
             else:
                 rate_penalty = sum(v for v in rate_stats.values()) / len(rate_stats)
+                mi_correction = None
 
             rate_loss = self.rate_weight * rate_penalty
             total = total + rate_loss
@@ -1307,6 +1314,9 @@ class DepthVideoLoss(nn.Module):
             loss_dict['omib_dynamic_r'] = r.item()
             loss_dict['lambda_depth'] = lambda_depth.item()
             loss_dict['lambda_video'] = lambda_video.item()
+            if mi_correction is not None:
+                loss_dict['cross_modal_mi_bits'] = rate_stats['cross_modal_mi_bits'].item()
+                loss_dict['mi_correction'] = mi_correction.item()
 
         if self.use_omib_like and 'omib_stats' in predictions:
             omib_stats = predictions['omib_stats']

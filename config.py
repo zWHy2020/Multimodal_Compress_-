@@ -67,6 +67,12 @@ class TrainingConfig:
         self.ib_beta = 1e-4
         self.ib_beta_min = 0.0
         self.ib_beta_max = None
+        self.mi_correction_weight = 1.0
+        self.use_mine_beta_bound = True
+        self.mine_beta_estimate_steps = 20
+        self.mine_train_steps = 50
+        self.mine_hidden_dim = 128
+        self.mine_lr = 1e-4
         self.temporal_consistency_weight = 0.02  # 【新增】视频时序一致性正则权重
         # 文本引导与条件约束（路线1默认）
         self.use_text_guidance_image = True
