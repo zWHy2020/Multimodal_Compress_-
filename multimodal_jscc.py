@@ -1038,6 +1038,34 @@ class JointEntropyModel(nn.Module):
         }
 
 
+
+
+class MineEstimator(nn.Module):
+    """MINE: 估计 I(X;Y) 的神经下界（Donsker-Varadhan 形式）。"""
+
+    def __init__(self, x_dim: int, y_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(x_dim + y_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 2 or y.dim() != 2:
+            raise RuntimeError('MineEstimator expects 2D tensors [B, D].')
+        if x.size(0) != y.size(0):
+            raise RuntimeError('MineEstimator expects matched batch size for x and y.')
+        joint = torch.cat([x, y], dim=-1)
+        y_perm = y[torch.randperm(y.size(0), device=y.device)]
+        marginal = torch.cat([x, y_perm], dim=-1)
+        t_joint = self.net(joint)
+        t_marginal = self.net(marginal)
+        mi_nat = t_joint.mean() - torch.log(torch.exp(t_marginal).mean().clamp_min(1e-8))
+        return mi_nat
+
 class DepthVideoJSCC(nn.Module):
     """深度图+视频双模态 JSCC（联合压缩版）。"""
 
@@ -1053,6 +1081,10 @@ class DepthVideoJSCC(nn.Module):
         channel_type: str = "awgn",
         snr_db: float = 10.0,
         power_normalization: bool = True,
+        enable_omib_stats: bool = True,
+        omib_eps: float = 1e-6,
+        enable_mi_correction: bool = True,
+        mine_hidden_dim: int = 128,
     ):
         super().__init__()
         self.depth_encoder = DepthJSCCEncoder(output_dim=depth_output_dim)
@@ -1076,6 +1108,10 @@ class DepthVideoJSCC(nn.Module):
         self.entropy_model = JointEntropyModel()
 
         self.channel = Channel(channel_type=channel_type, snr_db=snr_db, power_normalization=power_normalization)
+        self.enable_omib_stats = bool(enable_omib_stats)
+        self.omib_eps = float(omib_eps)
+        self.enable_mi_correction = bool(enable_mi_correction)
+        self.mine_estimator = MineEstimator(depth_output_dim, video_output_dim, hidden_dim=mine_hidden_dim) if self.enable_mi_correction else None
 
         self.power_normalizer = nn.ModuleDict()
         if power_normalization:
@@ -1153,4 +1189,35 @@ class DepthVideoJSCC(nn.Module):
             'depth_private_bpe': entropy_stats['depth_private_bpe'],
             'video_private_bpe': entropy_stats['video_private_bpe'],
         }
+
+        if self.enable_mi_correction and self.mine_estimator is not None:
+            depth_global = fused['depth_private'].mean(dim=(2, 3))
+            video_global = fused['video_private'].mean(dim=(1, 3, 4))
+            mi_nat = self.mine_estimator(depth_global, video_global)
+            mi_bits = (mi_nat / math.log(2.0)).clamp_min(0.0)
+            out['rate_stats']['cross_modal_mi_bits'] = mi_bits
+            out['entropy_stats']['cross_modal_mi_bits'] = mi_bits
+
+        if self.enable_omib_stats:
+            # OMIB-like 变分统计：用私有潜变量的经验高斯参数近似 q_d/q_v，
+            # 以便在损失侧实现 KL(q||N(0,I)) 正则。
+            depth_mu = fused['depth_private'].mean(dim=(2, 3))
+            depth_var = fused['depth_private'].var(dim=(2, 3), unbiased=False).clamp_min(self.omib_eps)
+            depth_logvar = torch.log(depth_var)
+
+            video_mu = fused['video_private'].mean(dim=(1, 3, 4))
+            video_var = fused['video_private'].var(dim=(1, 3, 4), unbiased=False).clamp_min(self.omib_eps)
+            video_logvar = torch.log(video_var)
+
+            depth_kl = 0.5 * (depth_mu.pow(2) + depth_var - 1.0 - depth_logvar)
+            video_kl = 0.5 * (video_mu.pow(2) + video_var - 1.0 - video_logvar)
+
+            out['omib_stats'] = {
+                'depth_mu': depth_mu,
+                'depth_logvar': depth_logvar,
+                'video_mu': video_mu,
+                'video_logvar': video_logvar,
+                'depth_kl': depth_kl.mean(),
+                'video_kl': video_kl.mean(),
+            }
         return out

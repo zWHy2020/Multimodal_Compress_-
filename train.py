@@ -34,6 +34,7 @@ from data_loader import MultimodalDataLoader, MultimodalDataset, collate_multimo
 from config import TrainingConfig
 from utils import AverageMeter, seed_torch, logger_configuration, makedirs, load_manifest
 from utils_check import print_model_structure_info, check_state_dict_compatibility
+from mine_utils import estimate_beta_upper_bound_mine
 
 
 def create_model(config: TrainingConfig) -> DepthVideoJSCC:
@@ -64,6 +65,9 @@ def create_model(config: TrainingConfig) -> DepthVideoJSCC:
         channel_type=config.channel_type,
         snr_db=config.snr_db,
         power_normalization=True,
+        enable_omib_stats=getattr(config, 'use_omib_like', True),
+        enable_mi_correction=True,
+        mine_hidden_dim=getattr(config, 'mine_hidden_dim', 128),
     )
     return model
 
@@ -74,6 +78,11 @@ def create_loss_fn(config: TrainingConfig) -> DepthVideoLoss:
         depth_weight=getattr(config, 'depth_weight', 1.0),
         video_weight=config.video_weight,
         rate_weight=getattr(config, 'rate_weight', 1e-4),
+        use_omib_like=getattr(config, 'use_omib_like', True),
+        ib_beta=getattr(config, 'ib_beta', 1e-4),
+        ib_beta_min=getattr(config, 'ib_beta_min', 0.0),
+        ib_beta_max=getattr(config, 'ib_beta_max', None),
+        mi_correction_weight=getattr(config, 'mi_correction_weight', 1.0),
     )
     return loss_fn
 
@@ -780,6 +789,16 @@ def main():
     parser.add_argument('--latent-down', type=int, default=None, help='生成器latent下采样倍率')
     parser.add_argument('--generative-gamma1', type=float, default=None, help='生成式图像MSE权重')
     parser.add_argument('--generative-gamma2', type=float, default=None, help='生成式图像LPIPS权重')
+    parser.add_argument('--use-omib-like', action=argparse.BooleanOptionalAction, default=None, help='启用OMIB-like损失项')
+    parser.add_argument('--ib-beta', type=float, default=None, help='OMIB-like KL权重beta')
+    parser.add_argument('--ib-beta-min', type=float, default=None, help='OMIB-like beta下界')
+    parser.add_argument('--ib-beta-max', type=float, default=None, help='OMIB-like beta上界（可选）')
+    parser.add_argument('--mi-correction-weight', type=float, default=None, help='跨模态互信息修正权重')
+    parser.add_argument('--use-mine-beta-bound', action=argparse.BooleanOptionalAction, default=None, help='使用MINE估计beta上界')
+    parser.add_argument('--mine-beta-estimate-steps', type=int, default=None, help='MINE用于beta估计的数据batch数')
+    parser.add_argument('--mine-train-steps', type=int, default=None, help='MINE训练步数')
+    parser.add_argument('--mine-hidden-dim', type=int, default=None, help='MINE隐藏层宽度')
+    parser.add_argument('--mine-lr', type=float, default=None, help='MINE学习率')
     parser.add_argument('--local-rank', type=int, default=None, help='分布式训练的本地进程rank')
     parser.add_argument('--distributed', action='store_true', help='启用分布式训练')
     args = parser.parse_args()
@@ -863,6 +882,26 @@ def main():
         config.generative_gamma1 = args.generative_gamma1
     if args.generative_gamma2 is not None:
         config.generative_gamma2 = args.generative_gamma2
+    if args.use_omib_like is not None:
+        config.use_omib_like = args.use_omib_like
+    if args.ib_beta is not None:
+        config.ib_beta = args.ib_beta
+    if args.ib_beta_min is not None:
+        config.ib_beta_min = args.ib_beta_min
+    if args.ib_beta_max is not None:
+        config.ib_beta_max = args.ib_beta_max
+    if args.mi_correction_weight is not None:
+        config.mi_correction_weight = args.mi_correction_weight
+    if args.use_mine_beta_bound is not None:
+        config.use_mine_beta_bound = args.use_mine_beta_bound
+    if args.mine_beta_estimate_steps is not None:
+        config.mine_beta_estimate_steps = args.mine_beta_estimate_steps
+    if args.mine_train_steps is not None:
+        config.mine_train_steps = args.mine_train_steps
+    if args.mine_hidden_dim is not None:
+        config.mine_hidden_dim = args.mine_hidden_dim
+    if args.mine_lr is not None:
+        config.mine_lr = args.mine_lr
     if args.train_snr_random:
         config.train_snr_strategy = "random"
         config.train_snr_random = True
@@ -1108,6 +1147,32 @@ def main():
     else:
         train_loader = data_loader_manager.create_dataloader(train_dataset, shuffle=True)
     
+
+    if getattr(config, 'use_mine_beta_bound', False):
+        try:
+            logger.info('使用 MINE 估计 OMIB beta 上界...')
+            mine_stats = estimate_beta_upper_bound_mine(
+                train_loader,
+                device=config.device,
+                max_steps=getattr(config, 'mine_beta_estimate_steps', 20),
+                mine_steps=getattr(config, 'mine_train_steps', 50),
+                hidden_dim=getattr(config, 'mine_hidden_dim', 128),
+                lr=getattr(config, 'mine_lr', 1e-4),
+            )
+            mu_upper = mine_stats['Mu_nat']
+            current_max = getattr(config, 'ib_beta_max', None)
+            config.ib_beta_max = mu_upper if current_max is None else min(current_max, mu_upper)
+            logger.info(
+                'MINE估计完成: H1_nat=%.6f H2_nat=%.6f I12_nat=%.6f Mu_nat=%.6f => ib_beta_max=%.6f',
+                mine_stats['H1_nat'],
+                mine_stats['H2_nat'],
+                mine_stats['I12_nat'],
+                mine_stats['Mu_nat'],
+                config.ib_beta_max,
+            )
+        except Exception as e:
+            logger.warning('MINE beta 上界估计失败，继续使用现有 ib_beta_max。原因: %s', e)
+
     # 创建验证数据集和加载器
     val_loader = None
     val_sampler = None
