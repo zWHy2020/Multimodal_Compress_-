@@ -1213,13 +1213,47 @@ class DepthMultimodalLoss(nn.Module):
 class DepthVideoLoss(nn.Module):
     """深度图+视频双模态损失（无文本/图像项）。"""
 
-    def __init__(self, depth_weight: float = 1.0, video_weight: float = 1.0, rate_weight: float = 1e-4):
+    def __init__(
+        self,
+        depth_weight: float = 1.0,
+        video_weight: float = 1.0,
+        rate_weight: float = 1e-4,
+        use_omib_like: bool = True,
+        ib_beta: float = 1e-4,
+        ib_beta_min: float = 0.0,
+        ib_beta_max: Optional[float] = None,
+        omib_eps: float = 1e-8,
+    ):
         super().__init__()
         self.depth_weight = depth_weight
         self.video_weight = video_weight
         self.rate_weight = rate_weight
+        self.use_omib_like = bool(use_omib_like)
+        self.ib_beta = float(ib_beta)
+        self.ib_beta_min = float(ib_beta_min)
+        self.ib_beta_max = None if ib_beta_max is None else float(ib_beta_max)
+        self.omib_eps = float(omib_eps)
         self.depth_loss_fn = DepthLoss()
         self.video_loss_fn = VideoLoss()
+
+    def _compute_dynamic_r(self, depth_task_loss: torch.Tensor, video_task_loss: torch.Tensor) -> torch.Tensor:
+        ratio = (video_task_loss.detach().clamp_min(self.omib_eps) / depth_task_loss.detach().clamp_min(self.omib_eps))
+        r = 1.0 - torch.tanh(torch.log(ratio))
+        return r.clamp(0.0, 2.0)
+
+    @staticmethod
+    def _modality_rate_weights(r: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 令两模态平均权重保持在 1 附近，避免整体 rate loss 尺度突变。
+        denom = (1.0 + r).clamp_min(1e-8)
+        lambda_depth = 2.0 / denom
+        lambda_video = 2.0 * r / denom
+        return lambda_depth, lambda_video
+
+    def _effective_ib_beta(self) -> float:
+        beta = max(self.ib_beta, self.ib_beta_min)
+        if self.ib_beta_max is not None:
+            beta = min(beta, self.ib_beta_max)
+        return beta
 
     def forward(self, predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Dict[str, float]:
         device = None
@@ -1233,10 +1267,14 @@ class DepthVideoLoss(nn.Module):
         total = torch.tensor(0.0, device=device)
         loss_dict: Dict[str, float] = {}
 
+        depth_task_loss = torch.tensor(0.0, device=device)
+        video_task_loss = torch.tensor(0.0, device=device)
+
         if 'depth_decoded' in predictions and 'depth' in targets:
             depth_loss, depth_comps = self.depth_loss_fn(predictions['depth_decoded'], targets['depth'])
             depth_loss = self.depth_weight * depth_loss
             total = total + depth_loss
+            depth_task_loss = depth_loss.detach()
             loss_dict['depth_loss'] = depth_loss.item()
             loss_dict.update(depth_comps)
 
@@ -1244,14 +1282,44 @@ class DepthVideoLoss(nn.Module):
             video_loss, video_comps = self.video_loss_fn(predictions['video_decoded'], targets['video'])
             video_loss = self.video_weight * video_loss
             total = total + video_loss
+            video_task_loss = video_loss.detach()
             loss_dict['video_loss'] = video_loss.item()
             loss_dict.update(video_comps)
 
         if 'rate_stats' in predictions and predictions['rate_stats']:
-            rate_penalty = sum(v for v in predictions['rate_stats'].values()) / len(predictions['rate_stats'])
+            rate_stats = predictions['rate_stats']
+            r = self._compute_dynamic_r(depth_task_loss, video_task_loss)
+            lambda_depth, lambda_video = self._modality_rate_weights(r)
+
+            # 优先使用分项码率；若不存在则回退到统一平均。
+            if all(k in rate_stats for k in ('shared_bpe', 'depth_private_bpe', 'video_private_bpe')):
+                rate_penalty = (
+                    rate_stats['shared_bpe']
+                    + lambda_depth * rate_stats['depth_private_bpe']
+                    + lambda_video * rate_stats['video_private_bpe']
+                )
+            else:
+                rate_penalty = sum(v for v in rate_stats.values()) / len(rate_stats)
+
             rate_loss = self.rate_weight * rate_penalty
             total = total + rate_loss
             loss_dict['rate_loss'] = rate_loss.item()
+            loss_dict['omib_dynamic_r'] = r.item()
+            loss_dict['lambda_depth'] = lambda_depth.item()
+            loss_dict['lambda_video'] = lambda_video.item()
+
+        if self.use_omib_like and 'omib_stats' in predictions:
+            omib_stats = predictions['omib_stats']
+            if 'depth_kl' in omib_stats and 'video_kl' in omib_stats:
+                r = self._compute_dynamic_r(depth_task_loss, video_task_loss)
+                beta_eff = self._effective_ib_beta()
+                omib_kl = omib_stats['depth_kl'] + r * omib_stats['video_kl']
+                omib_loss = beta_eff * omib_kl
+                total = total + omib_loss
+                loss_dict['omib_like_loss'] = omib_loss.item()
+                loss_dict['omib_depth_kl'] = omib_stats['depth_kl'].item()
+                loss_dict['omib_video_kl'] = omib_stats['video_kl'].item()
+                loss_dict['omib_beta_eff'] = float(beta_eff)
 
         loss_dict['total_loss'] = total
         return loss_dict

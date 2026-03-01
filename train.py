@@ -64,6 +64,7 @@ def create_model(config: TrainingConfig) -> DepthVideoJSCC:
         channel_type=config.channel_type,
         snr_db=config.snr_db,
         power_normalization=True,
+        enable_omib_stats=getattr(config, 'use_omib_like', True),
     )
     return model
 
@@ -74,6 +75,10 @@ def create_loss_fn(config: TrainingConfig) -> DepthVideoLoss:
         depth_weight=getattr(config, 'depth_weight', 1.0),
         video_weight=config.video_weight,
         rate_weight=getattr(config, 'rate_weight', 1e-4),
+        use_omib_like=getattr(config, 'use_omib_like', True),
+        ib_beta=getattr(config, 'ib_beta', 1e-4),
+        ib_beta_min=getattr(config, 'ib_beta_min', 0.0),
+        ib_beta_max=getattr(config, 'ib_beta_max', None),
     )
     return loss_fn
 
@@ -780,6 +785,10 @@ def main():
     parser.add_argument('--latent-down', type=int, default=None, help='生成器latent下采样倍率')
     parser.add_argument('--generative-gamma1', type=float, default=None, help='生成式图像MSE权重')
     parser.add_argument('--generative-gamma2', type=float, default=None, help='生成式图像LPIPS权重')
+    parser.add_argument('--use-omib-like', action=argparse.BooleanOptionalAction, default=None, help='启用OMIB-like损失项')
+    parser.add_argument('--ib-beta', type=float, default=None, help='OMIB-like KL权重beta')
+    parser.add_argument('--ib-beta-min', type=float, default=None, help='OMIB-like beta下界')
+    parser.add_argument('--ib-beta-max', type=float, default=None, help='OMIB-like beta上界（可选）')
     parser.add_argument('--local-rank', type=int, default=None, help='分布式训练的本地进程rank')
     parser.add_argument('--distributed', action='store_true', help='启用分布式训练')
     args = parser.parse_args()
@@ -863,6 +872,14 @@ def main():
         config.generative_gamma1 = args.generative_gamma1
     if args.generative_gamma2 is not None:
         config.generative_gamma2 = args.generative_gamma2
+    if args.use_omib_like is not None:
+        config.use_omib_like = args.use_omib_like
+    if args.ib_beta is not None:
+        config.ib_beta = args.ib_beta
+    if args.ib_beta_min is not None:
+        config.ib_beta_min = args.ib_beta_min
+    if args.ib_beta_max is not None:
+        config.ib_beta_max = args.ib_beta_max
     if args.train_snr_random:
         config.train_snr_strategy = "random"
         config.train_snr_random = True
