@@ -43,16 +43,6 @@ def create_model(config: TrainingConfig) -> DepthVideoJSCC:
             #standard_dims = [96, 192, 384, 768]
             #standard_depths = [2, 2, 6, 2]
             #standard_heads = [3, 6, 12, 24]
-            #if config.img_embed_dims != standard_dims:
-                #print(f"【自动修正】检测到预训练模型，将 embed_dims 从 {config.img_embed_dims} 修正为 {standard_dims}")
-                #config.img_embed_dims = standard_dims    
-            #if config.img_depths != standard_depths:
-                #config.img_depths = standard_depths
-            #if config.img_num_heads != standard_heads:
-                #config.img_num_heads = standard_heads
-            #if config.img_depths != standard_depths:
-                #print(f"正在强制修正 config.img_depths 为 {standard_depths} 以匹配预训练模型。")
-                #config.img_depths = standard_depths
     """创建深度图+视频双模态JSCC模型"""
     model = DepthVideoJSCC(
         img_size=config.img_size,
@@ -566,8 +556,6 @@ def train_one_epoch(
             for key in ['loss', 'depth_loss', 'video_loss']:
                 if key in meters:
                     meters[key].clear()
-        #if text_input is not None:
-            #del text_input
         #if image_input is not None:
             #del image_input
         #if video_input is not None:
@@ -942,7 +930,6 @@ def main():
         #state_dict = checkpoint['model_state_dict']
         #if not check_state_dict_compatibility(model, state_dict, logger):
             #logger.error("检测到维度不匹配，终止训练以防止错误传播！")
-            #logger.error("请检查 config.py 中的 img_embed_dims 是否与 checkpoint 中的一致。")
             #sys.exit(1)
         #model.load_state_dict(state_dict)
     
@@ -965,7 +952,6 @@ def main():
         logger.info("创建判别器...")
         from discriminator import MultimodalDiscriminator
         discriminator = MultimodalDiscriminator(
-            image_input_nc=3,
             video_input_nc=3,
             ndf=64,
             n_layers=3
@@ -1008,7 +994,6 @@ def main():
         num_workers=config.num_workers,
         shuffle=True,
         image_size=config.img_size,
-        max_text_length=config.max_text_length,
         max_video_frames=config.max_video_frames,
         video_clip_len=config.video_clip_len,
         video_stride=config.video_stride,
@@ -1130,10 +1115,6 @@ def main():
     model_config = {
         'img_size': config.img_size,
         'patch_size': config.patch_size,
-        'img_embed_dims': config.img_embed_dims,
-        'img_depths': config.img_depths,
-        'img_num_heads': config.img_num_heads,
-        'img_output_dim': config.img_output_dim,
         'video_hidden_dim': config.video_hidden_dim,
         'video_num_frames': config.video_num_frames,
         'video_use_optical_flow': config.video_use_optical_flow,
@@ -1142,13 +1123,6 @@ def main():
         'video_gop_size': getattr(config, "video_gop_size", None),
         'channel_type': config.channel_type,
         'normalize_inputs': getattr(config, "normalize", False),
-        'pretrained': getattr(config, 'pretrained', False),
-        'freeze_encoder': getattr(config, 'freeze_encoder', False),
-        'pretrained_model_name': getattr(config, 'pretrained_model_name', None),
-        'generator_type': getattr(config, 'generator_type', 'vae'),
-        'generator_ckpt': getattr(config, 'generator_ckpt', None),
-        'z_channels': getattr(config, 'z_channels', 4),
-        'latent_down': getattr(config, 'latent_down', 8),
         'video_clip_len': config.video_clip_len,
         'video_stride': config.video_stride,
         'video_sampling_strategy': config.video_sampling_strategy,

@@ -2,8 +2,8 @@
 多模态数据加载器（支持 Manifest v1/v2，严格模式）
 
 关键特性：
-- Manifest v2：每视频一条记录，text/texts 与 image/files 列表
-- 训练随机采样 caption/keyframe，验证固定 captions[0]/keyframes[0]
+- Manifest v2：每视频一条记录，包含 depth/video 资源
+- 训练/验证均以 depth+video 双模态样本组织
 - 视频按需抽帧（不读取全量帧），短视频 repeat-last + mask
 - 严格模式默认开启：关键模态缺失会丢弃样本并统计；可选 allow_missing_modalities 走零填充调试
 """
@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import os
 import random
-import warnings
 from functools import partial
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -90,10 +89,8 @@ class MultimodalDataset(Dataset):
         self,
         data_dir: str,
         data_list: Sequence[Dict[str, Any]],
-        text_tokenizer: Optional[Any] = None,
         image_transform: Optional[transforms.Compose] = None,
         video_transform: Optional[transforms.Compose] = None,
-        max_text_length: int = 512,
         max_video_frames: int = 10,
         video_clip_len: Optional[int] = None,
         video_stride: int = 1,
@@ -109,7 +106,6 @@ class MultimodalDataset(Dataset):
     ):
         self.data_dir = data_dir
         self.data_list = list(data_list)
-        self.text_tokenizer = text_tokenizer
         self.dynamic_image_sizes = None
         self.dynamic_video_sizes = None
         if image_transform is None and is_train:
@@ -118,7 +114,6 @@ class MultimodalDataset(Dataset):
         if video_transform is None and is_train:
             self.dynamic_video_sizes = _build_dynamic_sizes(image_size)
         self.video_transform = video_transform or _default_video_transform(image_size, normalize)
-        self.max_text_length = max_text_length
         self.max_video_frames = max_video_frames
         self.video_clip_len = video_clip_len or max_video_frames
         self.video_stride = video_stride
@@ -130,15 +125,9 @@ class MultimodalDataset(Dataset):
         self.strict_mode = strict_mode
         self.required_modalities = required_modalities
         self.normalize = normalize
-        self.text_pad_token_id = (
-            getattr(self.text_tokenizer, "pad_token_id", 0) if self.text_tokenizer is not None else 0
-        )
         self.drop_count = 0
         self.missing_counts: Dict[str, int] = {"video": 0, "depth": 0}
         self.random_state = random.Random(seed)
-        self.version = "v2" if any("texts" in item.get("text", {}) for item in self.data_list) else "v1"
-        if self.version == "v1":
-            warnings.warn("检测到 manifest v1：会导致重复解码与语义错配，建议迁移到 v2。", UserWarning)
 
     def _select_dynamic_size(self, candidates: Optional[List[Tuple[int, int]]]) -> Optional[Tuple[int, int]]:
         if not candidates:
@@ -404,9 +393,7 @@ class MultimodalDataLoader:
         batch_size: int = 32,
         num_workers: int = 4,
         shuffle: bool = True,
-        text_tokenizer: Optional[Any] = None,
         image_size: Tuple[int, int] = (224, 224),
-        max_text_length: int = 512,
         max_video_frames: int = 10,
         video_clip_len: Optional[int] = None,
         video_stride: int = 1,
@@ -423,9 +410,7 @@ class MultimodalDataLoader:
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.shuffle = shuffle
-        self.text_tokenizer = text_tokenizer
         self.image_size = image_size
-        self.max_text_length = max_text_length
         self.max_video_frames = max_video_frames
         self.video_clip_len = video_clip_len
         self.video_stride = video_stride
@@ -453,10 +438,8 @@ class MultimodalDataLoader:
         return MultimodalDataset(
             data_dir=self.data_dir,
             data_list=data_list,
-            text_tokenizer=self.text_tokenizer,
             image_transform=image_transform,
             video_transform=video_transform,
-            max_text_length=self.max_text_length,
             max_video_frames=self.max_video_frames,
             video_clip_len=self.video_clip_len,
             video_stride=self.video_stride,
@@ -518,7 +501,6 @@ if __name__ == "__main__":
     parser.add_argument("--max_video_frames", type=int, default=10)
     parser.add_argument("--video_clip_len", type=int, default=None)
     parser.add_argument("--video_sampling_strategy", type=str, default="uniform")
-    parser.add_argument("--max_text_length", type=int, default=64)
     parser.add_argument("--image_size", type=int, nargs=2, default=(224, 224))
     parser.add_argument("--normalize", action="store_true", help="启用 ImageNet 归一化")
     args = parser.parse_args()
@@ -530,7 +512,6 @@ if __name__ == "__main__":
     dataset = MultimodalDataset(
         data_dir=args.data_dir,
         data_list=manifest_data,
-        max_text_length=args.max_text_length,
         max_video_frames=args.max_video_frames,
         video_clip_len=args.video_clip_len,
         video_sampling_strategy=args.video_sampling_strategy,

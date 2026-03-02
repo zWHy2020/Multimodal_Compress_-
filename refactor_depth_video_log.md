@@ -61,3 +61,32 @@
   - https://ieeexplore.ieee.org/document/1292216
 
 > 说明：本次日志仅引用公开可访问文献/论文主页；未添加无法验证来源的链接。
+
+## 二次清理（按审阅意见追加）
+
+7. **`config.py` 移除 Text/RGB 配置残留**
+   - 在 `TrainingConfig` / `EvaluationConfig` 中删除文本词表、文本编码器、文本引导、Swin 图像分支、VAE 生成器等字段。
+   - 保留与 depth+video 路径直接相关的参数（DepthVideoJSCC、视频时序/熵模型、SNR/信道、OMIB/MINE、训练调度）。
+   - 原因：配置层面应与计算图一致，避免 checkpoint 和运行参数继续携带废弃模态。
+
+8. **`train.py` 清除 checkpoint 与判别器中的 RGB 参数残留**
+   - 精简 `model_config`，移除 `img_embed_dims/img_depths/img_num_heads/generator_*` 等历史字段。
+   - 判别器实例化不再显式传入 `image_input_nc=3`。
+   - 原因：训练态元信息应仅表达 depth+video 体系，防止恢复训练时加载无关配置。
+
+9. **`cross_attention.py` 废弃三模态交互实现，仅保留基础 CrossAttention**
+   - 删除 `MultiModalCrossAttention` 及 text↔image↔video 两两耦合结构，仅保留 video 语义引导实际使用的标准缩放点积交叉注意力。
+   - 原因：避免保留未使用的三模态死代码，同时不破坏视频分支对 CrossAttention 的依赖。
+
+10. **`data_loader.py` 清除初始化参数残留**
+   - 从 `MultimodalDataset` / `MultimodalDataLoader` 的 `__init__` 去掉 `text_tokenizer`、`max_text_length`。
+   - 移除依赖 `item["text"]` 的版本检测逻辑。
+   - 原因：数据接口层面严格限定到 depth/video，避免调用方误传文本相关参数。
+
+## 新增清理依据（程序/论文/数学）
+- Scaled Dot-Product Attention（交叉注意力基础）: Vaswani et al., 2017.
+  - https://arxiv.org/abs/1706.03762
+- Swin Transformer（已清理的图像分支历史配置来源）: Liu et al., 2021.
+  - https://arxiv.org/abs/2103.14030
+- Latent Diffusion / SD-VAE（已清理的 generator 配置来源）: Rombach et al., 2022.
+  - https://arxiv.org/abs/2112.10752
