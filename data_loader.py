@@ -2,8 +2,8 @@
 多模态数据加载器（支持 Manifest v1/v2，严格模式）
 
 关键特性：
-- Manifest v2：每视频一条记录，text/texts 与 image/files 列表
-- 训练随机采样 caption/keyframe，验证固定 captions[0]/keyframes[0]
+- Manifest v2：每视频一条记录，包含 depth/video 资源
+- 训练/验证均以 depth+video 双模态样本组织
 - 视频按需抽帧（不读取全量帧），短视频 repeat-last + mask
 - 严格模式默认开启：关键模态缺失会丢弃样本并统计；可选 allow_missing_modalities 走零填充调试
 """
@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import os
 import random
-import warnings
 from functools import partial
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -27,6 +26,8 @@ from torchvision import transforms
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+DEPTH_MEAN = [0.5]
+DEPTH_STD = [0.5]
 
 
 def _default_image_transform(image_size: Tuple[int, int], normalize: bool) -> transforms.Compose:
@@ -38,6 +39,18 @@ def _default_image_transform(image_size: Tuple[int, int], normalize: bool) -> tr
         transform_steps.append(transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
     return transforms.Compose(transform_steps)
 
+
+
+
+def _default_depth_transform(image_size: Tuple[int, int], normalize: bool) -> transforms.Compose:
+    transform_steps = [
+        transforms.Resize(image_size),
+        transforms.ToTensor(),
+    ]
+    if normalize:
+        # 深度图为单通道，使用单通道归一化避免与 RGB 统计量维度不匹配。
+        transform_steps.append(transforms.Normalize(mean=DEPTH_MEAN, std=DEPTH_STD))
+    return transforms.Compose(transform_steps)
 
 def _default_video_transform(image_size: Tuple[int, int], normalize: bool) -> transforms.Compose:
     transform_steps = [
@@ -68,13 +81,16 @@ def _build_dynamic_sizes(
     return sorted(set(sizes))
 
 
-def _build_resize_transform(size: Tuple[int, int], normalize: bool) -> transforms.Compose:
+def _build_resize_transform(size: Tuple[int, int], normalize: bool, channels: int = 3) -> transforms.Compose:
     transform_steps = [
         transforms.Resize(size),
         transforms.ToTensor(),
     ]
     if normalize:
-        transform_steps.append(transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
+        if channels == 1:
+            transform_steps.append(transforms.Normalize(mean=DEPTH_MEAN, std=DEPTH_STD))
+        else:
+            transform_steps.append(transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
     return transforms.Compose(transform_steps)
 
 
@@ -90,10 +106,8 @@ class MultimodalDataset(Dataset):
         self,
         data_dir: str,
         data_list: Sequence[Dict[str, Any]],
-        text_tokenizer: Optional[Any] = None,
         image_transform: Optional[transforms.Compose] = None,
         video_transform: Optional[transforms.Compose] = None,
-        max_text_length: int = 512,
         max_video_frames: int = 10,
         video_clip_len: Optional[int] = None,
         video_stride: int = 1,
@@ -109,16 +123,15 @@ class MultimodalDataset(Dataset):
     ):
         self.data_dir = data_dir
         self.data_list = list(data_list)
-        self.text_tokenizer = text_tokenizer
         self.dynamic_image_sizes = None
         self.dynamic_video_sizes = None
         if image_transform is None and is_train:
             self.dynamic_image_sizes = _build_dynamic_sizes(image_size)
         self.image_transform = image_transform or _default_image_transform(image_size, normalize)
+        self.depth_transform = _default_depth_transform(image_size, normalize)
         if video_transform is None and is_train:
             self.dynamic_video_sizes = _build_dynamic_sizes(image_size)
         self.video_transform = video_transform or _default_video_transform(image_size, normalize)
-        self.max_text_length = max_text_length
         self.max_video_frames = max_video_frames
         self.video_clip_len = video_clip_len or max_video_frames
         self.video_stride = video_stride
@@ -130,27 +143,21 @@ class MultimodalDataset(Dataset):
         self.strict_mode = strict_mode
         self.required_modalities = required_modalities
         self.normalize = normalize
-        self.text_pad_token_id = (
-            getattr(self.text_tokenizer, "pad_token_id", 0) if self.text_tokenizer is not None else 0
-        )
         self.drop_count = 0
-        self.missing_counts: Dict[str, int] = {"text": 0, "image": 0, "video": 0, "depth": 0}
+        self.missing_counts: Dict[str, int] = {"video": 0, "depth": 0}
         self.random_state = random.Random(seed)
-        self.version = "v2" if any("texts" in item.get("text", {}) for item in self.data_list) else "v1"
-        if self.version == "v1":
-            warnings.warn("检测到 manifest v1：会导致重复解码与语义错配，建议迁移到 v2。", UserWarning)
 
     def _select_dynamic_size(self, candidates: Optional[List[Tuple[int, int]]]) -> Optional[Tuple[int, int]]:
         if not candidates:
             return None
         return self.random_state.choice(candidates)
 
-    def _apply_image_transform(self, image: Image.Image) -> torch.Tensor:
+    def _apply_image_transform(self, image: Image.Image, is_depth: bool = False) -> torch.Tensor:
         size = self._select_dynamic_size(self.dynamic_image_sizes)
         if size is not None:
-            transform = _build_resize_transform(size, self.normalize)
+            transform = _build_resize_transform(size, self.normalize, channels=1 if is_depth else 3)
             return transform(image)
-        return self.image_transform(image)
+        return self.depth_transform(image) if is_depth else self.image_transform(image)
 
     def _apply_video_transform(self, frame: Image.Image, size: Optional[Tuple[int, int]]) -> torch.Tensor:
         if size is not None:
@@ -161,61 +168,10 @@ class MultimodalDataset(Dataset):
     def __len__(self) -> int:
         return len(self.data_list)
 
-    def _select_caption(self, text_info: Dict[str, Any]) -> Tuple[str, int]:
-        if "texts" in text_info:
-            texts = text_info["texts"]
-            if not texts:
-                raise ValueError("text.texts 为空")
-            if self.is_train:
-                idx = self.random_state.randint(0, len(texts) - 1)
-            else:
-                idx = 0
-            return texts[idx], idx
-        text = text_info.get("text", "")
-        return text, 0
-
-    def _select_keyframe(self, image_info: Dict[str, Any]) -> Tuple[str, int]:
-        if "files" in image_info:
-            files = image_info["files"]
-            if not files:
-                raise ValueError("image.files 为空")
-            if self.is_train:
-                idx = self.random_state.randint(0, len(files) - 1)
-            else:
-                idx = 0
-            return files[idx], idx
-        return image_info["file"], 0
-
-    def _tokenize(self, text: str) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.text_tokenizer:
-            tokens = self.text_tokenizer(
-                text, max_length=self.max_text_length, truncation=True, padding="max_length", return_tensors="pt"
-            )
-            input_ids = tokens["input_ids"].squeeze(0)
-            attention_mask = tokens["attention_mask"].squeeze(0)
-        else:
-            encoded = [ord(c) for c in text[: self.max_text_length]]
-            input_ids = torch.tensor(encoded, dtype=torch.long)
-            pad_len = self.max_text_length - input_ids.shape[0]
-            if pad_len > 0:
-                input_ids = torch.cat(
-                    [input_ids, torch.full((pad_len,), self.text_pad_token_id, dtype=torch.long)], dim=0
-                )
-            attention_mask = torch.zeros_like(input_ids)
-            attention_mask[: len(encoded)] = 1
-        return input_ids, attention_mask
-
-    def _load_image(self, image_path: str) -> torch.Tensor:
-        full_path = os.path.join(self.data_dir, image_path)
-        image = Image.open(full_path).convert("RGB")
-        return self._apply_image_transform(image)
-
-
-
     def _load_depth(self, depth_path: str) -> torch.Tensor:
         full_path = os.path.join(self.data_dir, depth_path)
         depth = Image.open(full_path).convert("L")
-        depth = self._apply_image_transform(depth)
+        depth = self._apply_image_transform(depth, is_depth=True)
         if depth.dim() == 3 and depth.size(0) != 1:
             depth = depth[:1]
         return depth
@@ -323,33 +279,6 @@ class MultimodalDataset(Dataset):
         meta = sample["meta"]
         meta["video_id"] = item.get("meta", {}).get("video_id") or os.path.splitext(os.path.basename(item.get("video", {}).get("file", "")))[0]
         try:
-            caption, caption_idx = self._select_caption(item.get("text", {}))
-            input_ids, attention_mask = self._tokenize(caption)
-            sample["text"] = input_ids
-            sample["text_attention_mask"] = attention_mask
-            sample["pad_token_id"] = self.text_pad_token_id
-            sample["valid"]["text"] = True
-            meta["caption_idx"] = caption_idx
-        except Exception as exc:
-            self.missing_counts["text"] += 1
-            sample["valid"]["text"] = False
-            if self.strict_mode and "text" in self.required_modalities:
-                self.drop_count += 1
-                sample["_dropped"] = f"text_error: {exc}"
-                return sample
-        try:
-            image_path, keyframe_idx = self._select_keyframe(item.get("image", {}))
-            sample["image"] = self._load_image(image_path)
-            sample["valid"]["image"] = True
-            meta["keyframe_idx"] = keyframe_idx
-        except Exception:
-            self.missing_counts["image"] += 1
-            sample["valid"]["image"] = False
-            if self.strict_mode and "image" in self.required_modalities:
-                self.drop_count += 1
-                sample["_dropped"] = "image_error"
-                return sample
-        try:
             depth_info = item.get("depth", {})
             depth_path = depth_info.get("file")
             if not depth_path:
@@ -380,16 +309,11 @@ class MultimodalDataset(Dataset):
                 return sample
         # 允许缺失模态时的填充
         if self.allow_missing_modalities and not self.strict_mode:
-            if not sample["valid"].get("image", False):
-                sample["image"] = torch.zeros((3, *self.image_size), dtype=torch.float32)
             if not sample["valid"].get("video", False):
                 sample["video"] = torch.zeros((self.max_video_frames, 3, *self.image_size), dtype=torch.float32)
                 sample["video_frame_mask"] = torch.zeros(self.max_video_frames, dtype=torch.float32)
             if not sample["valid"].get("depth", False):
                 sample["depth"] = torch.zeros((1, *self.image_size), dtype=torch.float32)
-            if not sample["valid"].get("text", False):
-                sample["text"] = torch.full((self.max_text_length,), self.text_pad_token_id, dtype=torch.long)
-                sample["text_attention_mask"] = torch.zeros(self.max_text_length, dtype=torch.long)
         return sample
 
 
@@ -443,27 +367,8 @@ def collate_multimodal_batch(
     inputs: Dict[str, Any] = {}
     targets: Dict[str, Any] = {}
     metas: List[Dict[str, Any]] = [s.get("meta", {}) for s in filtered_samples]
-    valid_flags: Dict[str, List[bool]] = {"text": [], "image": [], "video": [], "depth": []}
+    valid_flags: Dict[str, List[bool]] = {"video": [], "depth": []}
 
-    # 文本
-    if all(s.get("text") is not None for s in filtered_samples):
-        text_tensors = [s["text"] for s in filtered_samples]
-        attn_masks = [s["text_attention_mask"] for s in filtered_samples]
-        pad_token = filtered_samples[0].get("pad_token_id", 0)
-        inputs["text_input"] = _pad_sequence(text_tensors, pad_token)
-        inputs["text_attention_mask"] = _pad_sequence(attn_masks, 0)
-        targets["text"] = inputs["text_input"]
-        valid_flags["text"] = [s.get("valid", {}).get("text", False) for s in filtered_samples]
-
-    # 图像
-    if all("image" in s for s in filtered_samples):
-        image_tensors = [s["image"] for s in filtered_samples]
-        max_h = max(img.shape[1] for img in image_tensors)
-        max_w = max(img.shape[2] for img in image_tensors)
-        images = torch.stack([_pad_image_tensor(img, max_h, max_w) for img in image_tensors])
-        inputs["image_input"] = images
-        targets["image"] = images
-        valid_flags["image"] = [s.get("valid", {}).get("image", False) for s in filtered_samples]
 
 
     # 深度
@@ -494,8 +399,6 @@ def collate_multimodal_batch(
         "meta": metas,
         "valid": valid_flags,
     }
-    if "text_attention_mask" in inputs:
-        batch_data["attention_mask"] = inputs["text_attention_mask"]
     return batch_data
 
 
@@ -508,9 +411,7 @@ class MultimodalDataLoader:
         batch_size: int = 32,
         num_workers: int = 4,
         shuffle: bool = True,
-        text_tokenizer: Optional[Any] = None,
         image_size: Tuple[int, int] = (224, 224),
-        max_text_length: int = 512,
         max_video_frames: int = 10,
         video_clip_len: Optional[int] = None,
         video_stride: int = 1,
@@ -527,9 +428,7 @@ class MultimodalDataLoader:
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.shuffle = shuffle
-        self.text_tokenizer = text_tokenizer
         self.image_size = image_size
-        self.max_text_length = max_text_length
         self.max_video_frames = max_video_frames
         self.video_clip_len = video_clip_len
         self.video_stride = video_stride
@@ -557,10 +456,8 @@ class MultimodalDataLoader:
         return MultimodalDataset(
             data_dir=self.data_dir,
             data_list=data_list,
-            text_tokenizer=self.text_tokenizer,
             image_transform=image_transform,
             video_transform=video_transform,
-            max_text_length=self.max_text_length,
             max_video_frames=self.max_video_frames,
             video_clip_len=self.video_clip_len,
             video_stride=self.video_stride,
@@ -606,7 +503,7 @@ def _print_sample_shapes(sample: Dict[str, Any], index: int) -> None:
         return str(type(value))
 
     print(f"Sample {index}:")
-    for key in ("video", "image", "text", "text_attention_mask", "video_frame_mask"):
+    for key in ("video", "depth", "video_frame_mask"):
         if key in sample:
             print(f"  {key}: {shape_of(sample[key])}")
     print(f"  meta: {sample.get('meta', {})}")
@@ -622,7 +519,6 @@ if __name__ == "__main__":
     parser.add_argument("--max_video_frames", type=int, default=10)
     parser.add_argument("--video_clip_len", type=int, default=None)
     parser.add_argument("--video_sampling_strategy", type=str, default="uniform")
-    parser.add_argument("--max_text_length", type=int, default=64)
     parser.add_argument("--image_size", type=int, nargs=2, default=(224, 224))
     parser.add_argument("--normalize", action="store_true", help="启用 ImageNet 归一化")
     args = parser.parse_args()
@@ -634,7 +530,6 @@ if __name__ == "__main__":
     dataset = MultimodalDataset(
         data_dir=args.data_dir,
         data_list=manifest_data,
-        max_text_length=args.max_text_length,
         max_video_frames=args.max_video_frames,
         video_clip_len=args.video_clip_len,
         video_sampling_strategy=args.video_sampling_strategy,
