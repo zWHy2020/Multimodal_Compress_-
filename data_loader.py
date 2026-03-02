@@ -134,7 +134,7 @@ class MultimodalDataset(Dataset):
             getattr(self.text_tokenizer, "pad_token_id", 0) if self.text_tokenizer is not None else 0
         )
         self.drop_count = 0
-        self.missing_counts: Dict[str, int] = {"text": 0, "image": 0, "video": 0, "depth": 0}
+        self.missing_counts: Dict[str, int] = {"video": 0, "depth": 0}
         self.random_state = random.Random(seed)
         self.version = "v2" if any("texts" in item.get("text", {}) for item in self.data_list) else "v1"
         if self.version == "v1":
@@ -160,57 +160,6 @@ class MultimodalDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.data_list)
-
-    def _select_caption(self, text_info: Dict[str, Any]) -> Tuple[str, int]:
-        if "texts" in text_info:
-            texts = text_info["texts"]
-            if not texts:
-                raise ValueError("text.texts 为空")
-            if self.is_train:
-                idx = self.random_state.randint(0, len(texts) - 1)
-            else:
-                idx = 0
-            return texts[idx], idx
-        text = text_info.get("text", "")
-        return text, 0
-
-    def _select_keyframe(self, image_info: Dict[str, Any]) -> Tuple[str, int]:
-        if "files" in image_info:
-            files = image_info["files"]
-            if not files:
-                raise ValueError("image.files 为空")
-            if self.is_train:
-                idx = self.random_state.randint(0, len(files) - 1)
-            else:
-                idx = 0
-            return files[idx], idx
-        return image_info["file"], 0
-
-    def _tokenize(self, text: str) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.text_tokenizer:
-            tokens = self.text_tokenizer(
-                text, max_length=self.max_text_length, truncation=True, padding="max_length", return_tensors="pt"
-            )
-            input_ids = tokens["input_ids"].squeeze(0)
-            attention_mask = tokens["attention_mask"].squeeze(0)
-        else:
-            encoded = [ord(c) for c in text[: self.max_text_length]]
-            input_ids = torch.tensor(encoded, dtype=torch.long)
-            pad_len = self.max_text_length - input_ids.shape[0]
-            if pad_len > 0:
-                input_ids = torch.cat(
-                    [input_ids, torch.full((pad_len,), self.text_pad_token_id, dtype=torch.long)], dim=0
-                )
-            attention_mask = torch.zeros_like(input_ids)
-            attention_mask[: len(encoded)] = 1
-        return input_ids, attention_mask
-
-    def _load_image(self, image_path: str) -> torch.Tensor:
-        full_path = os.path.join(self.data_dir, image_path)
-        image = Image.open(full_path).convert("RGB")
-        return self._apply_image_transform(image)
-
-
 
     def _load_depth(self, depth_path: str) -> torch.Tensor:
         full_path = os.path.join(self.data_dir, depth_path)
@@ -323,33 +272,6 @@ class MultimodalDataset(Dataset):
         meta = sample["meta"]
         meta["video_id"] = item.get("meta", {}).get("video_id") or os.path.splitext(os.path.basename(item.get("video", {}).get("file", "")))[0]
         try:
-            caption, caption_idx = self._select_caption(item.get("text", {}))
-            input_ids, attention_mask = self._tokenize(caption)
-            sample["text"] = input_ids
-            sample["text_attention_mask"] = attention_mask
-            sample["pad_token_id"] = self.text_pad_token_id
-            sample["valid"]["text"] = True
-            meta["caption_idx"] = caption_idx
-        except Exception as exc:
-            self.missing_counts["text"] += 1
-            sample["valid"]["text"] = False
-            if self.strict_mode and "text" in self.required_modalities:
-                self.drop_count += 1
-                sample["_dropped"] = f"text_error: {exc}"
-                return sample
-        try:
-            image_path, keyframe_idx = self._select_keyframe(item.get("image", {}))
-            sample["image"] = self._load_image(image_path)
-            sample["valid"]["image"] = True
-            meta["keyframe_idx"] = keyframe_idx
-        except Exception:
-            self.missing_counts["image"] += 1
-            sample["valid"]["image"] = False
-            if self.strict_mode and "image" in self.required_modalities:
-                self.drop_count += 1
-                sample["_dropped"] = "image_error"
-                return sample
-        try:
             depth_info = item.get("depth", {})
             depth_path = depth_info.get("file")
             if not depth_path:
@@ -380,16 +302,11 @@ class MultimodalDataset(Dataset):
                 return sample
         # 允许缺失模态时的填充
         if self.allow_missing_modalities and not self.strict_mode:
-            if not sample["valid"].get("image", False):
-                sample["image"] = torch.zeros((3, *self.image_size), dtype=torch.float32)
             if not sample["valid"].get("video", False):
                 sample["video"] = torch.zeros((self.max_video_frames, 3, *self.image_size), dtype=torch.float32)
                 sample["video_frame_mask"] = torch.zeros(self.max_video_frames, dtype=torch.float32)
             if not sample["valid"].get("depth", False):
                 sample["depth"] = torch.zeros((1, *self.image_size), dtype=torch.float32)
-            if not sample["valid"].get("text", False):
-                sample["text"] = torch.full((self.max_text_length,), self.text_pad_token_id, dtype=torch.long)
-                sample["text_attention_mask"] = torch.zeros(self.max_text_length, dtype=torch.long)
         return sample
 
 
@@ -443,27 +360,8 @@ def collate_multimodal_batch(
     inputs: Dict[str, Any] = {}
     targets: Dict[str, Any] = {}
     metas: List[Dict[str, Any]] = [s.get("meta", {}) for s in filtered_samples]
-    valid_flags: Dict[str, List[bool]] = {"text": [], "image": [], "video": [], "depth": []}
+    valid_flags: Dict[str, List[bool]] = {"video": [], "depth": []}
 
-    # 文本
-    if all(s.get("text") is not None for s in filtered_samples):
-        text_tensors = [s["text"] for s in filtered_samples]
-        attn_masks = [s["text_attention_mask"] for s in filtered_samples]
-        pad_token = filtered_samples[0].get("pad_token_id", 0)
-        inputs["text_input"] = _pad_sequence(text_tensors, pad_token)
-        inputs["text_attention_mask"] = _pad_sequence(attn_masks, 0)
-        targets["text"] = inputs["text_input"]
-        valid_flags["text"] = [s.get("valid", {}).get("text", False) for s in filtered_samples]
-
-    # 图像
-    if all("image" in s for s in filtered_samples):
-        image_tensors = [s["image"] for s in filtered_samples]
-        max_h = max(img.shape[1] for img in image_tensors)
-        max_w = max(img.shape[2] for img in image_tensors)
-        images = torch.stack([_pad_image_tensor(img, max_h, max_w) for img in image_tensors])
-        inputs["image_input"] = images
-        targets["image"] = images
-        valid_flags["image"] = [s.get("valid", {}).get("image", False) for s in filtered_samples]
 
 
     # 深度
@@ -494,8 +392,6 @@ def collate_multimodal_batch(
         "meta": metas,
         "valid": valid_flags,
     }
-    if "text_attention_mask" in inputs:
-        batch_data["attention_mask"] = inputs["text_attention_mask"]
     return batch_data
 
 
@@ -606,7 +502,7 @@ def _print_sample_shapes(sample: Dict[str, Any], index: int) -> None:
         return str(type(value))
 
     print(f"Sample {index}:")
-    for key in ("video", "image", "text", "text_attention_mask", "video_frame_mask"):
+    for key in ("video", "depth", "video_frame_mask"):
         if key in sample:
             print(f"  {key}: {shape_of(sample[key])}")
     print(f"  meta: {sample.get('meta', {})}")
