@@ -115,7 +115,7 @@ class TrainingConfig:
         self.discriminator_weight = self.gan_weight
         self.use_r1_regularization = False
         self.r1_gamma = 10.0
-        self.ddp_find_unused_parameters = True
+        self.ddp_find_unused_parameters = False
         self.use_quantization_noise = True
         self.quantization_noise_range = 0.5
         self.normalize = True

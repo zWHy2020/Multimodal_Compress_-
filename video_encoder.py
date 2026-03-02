@@ -892,7 +892,6 @@ class VideoJSCCDecoder(nn.Module):
         input_dim: int = 256,
         img_size: Tuple[int, int] = (224, 224),
         patch_size: int = 4,
-        semantic_context_dim: int = 256,
         mlp_ratio: float = 4.0,  # 添加语义上下文维度参数
         latent_upsample_factor: int = 2,
         normalize_output: bool = False,
@@ -908,7 +907,6 @@ class VideoJSCCDecoder(nn.Module):
         self.use_convlstm = use_convlstm
         self.img_size = img_size
         self.patch_size = patch_size
-        self.semantic_context_dim = semantic_context_dim
         self.normalize_output = normalize_output
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.register_buffer("output_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
@@ -941,23 +939,7 @@ class VideoJSCCDecoder(nn.Module):
             nn.Linear(hidden_dim // 2, hidden_dim)
         )
         
-        # 语义对齐层：在 __init__ 中预定义，而不是在 forward 中动态创建
-        # 用于将语义上下文维度对齐到视频特征维度
-        # 视频特征维度：hidden_dim (例如 256)
-        self.semantic_aligner = nn.Linear(semantic_context_dim, hidden_dim)
-        
-        # 【修复】使用标准CrossAttention模块替代简化的自定义注意力实现
-        # 导入并使用标准CrossAttention模块（与ImageJSCCDecoder保持一致）
-        from cross_attention import CrossAttention
-        # CrossAttention 需要 embed_dim 参数，这里使用 hidden_dim（对齐后的维度）
-        self.cross_attention = CrossAttention(
-            embed_dim=hidden_dim,
-            num_heads=max(1, hidden_dim // 64),  # 自适应头数：256//64=4
-            dropout=0.0  # 可以使用dropout，这里设为0保持与原有实现一致
-        )
-        
-        # 记录最近的语义注意力统计
-        self.last_semantic_gate_stats: Dict[str, Optional[float]] = {"mean": None, "std": None}
+        # 语义分支已移除；保留 forward 的 semantic_context 参数仅用于接口兼容。
     
     def forward(
         self,
@@ -974,7 +956,7 @@ class VideoJSCCDecoder(nn.Module):
             noisy_features (torch.Tensor): 带噪特征 [B, T(+1), C, H, W]
             guide_vectors (torch.Tensor): 引导向量 [B, T, guide_dim]
             reset_state (bool): 是否重置隐藏状态
-            semantic_context (torch.Tensor, optional): 语义上下文 [B, seq_len, D_ctx] 或空间张量
+            semantic_context (torch.Tensor, optional): 兼容旧接口，当前未使用
             
         Returns:
             torch.Tensor: 重建视频 [B, T, C, H, W]
@@ -1003,8 +985,6 @@ class VideoJSCCDecoder(nn.Module):
             guide_processed = self.guide_processor(current_guide)
             guide_expanded = guide_processed.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, H, W)
             current_feature = current_feature + guide_expanded
-            if semantic_context is not None:
-                current_feature = self._apply_semantic_guidance(current_feature, semantic_context)
             enhanced_features.append(current_feature)
 
         enhanced_features = torch.stack(enhanced_features, dim=1)
@@ -1046,76 +1026,6 @@ class VideoJSCCDecoder(nn.Module):
             decoded_frames = decoded_frames[..., : output_size[0], : output_size[1]]
 
         return decoded_frames
-    
-    def _apply_semantic_guidance(
-        self, 
-        video_features: torch.Tensor, 
-        semantic_context: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        【修复】应用语义引导的交叉注意力 - 使用标准CrossAttention模块
-        
-        Args:
-            video_features (torch.Tensor): 视频特征 [B, C, H, W]
-            semantic_context (torch.Tensor): 语义上下文 [B, seq_len, D_ctx] 或 [B, C, H, W]
-            
-        Returns:
-            torch.Tensor: 增强后的视频特征
-        """
-        B, C, H, W = video_features.shape
-        
-        # 将视频特征重塑为序列格式
-        video_seq = video_features.view(B, C, -1).transpose(1, 2)  # [B, H*W, C]
-        
-        # 将上下文统一到序列格式 [B, L, D]
-        if semantic_context.dim() == 4:
-            semantic_context = semantic_context.flatten(2).transpose(1, 2)  # [B, H*W, C]
-        elif semantic_context.dim() == 5:
-            semantic_context = semantic_context.permute(0, 1, 3, 4, 2).reshape(
-                semantic_context.size(0), -1, semantic_context.size(2)
-            )  # [B, T*H*W, C]
-        elif semantic_context.dim() != 3:
-            raise RuntimeError(
-                f"semantic_context 维度不支持: got {semantic_context.dim()}, expected 3/4/5."
-            )
-
-        if semantic_context.shape[-1] != self.hidden_dim:
-            if semantic_context.shape[-1] != self.semantic_context_dim:
-                raise RuntimeError(
-                    f"语义对齐层维度不匹配："
-                    f"context维度={semantic_context.shape[-1]}, 预期={self.semantic_context_dim}; "
-                    f"video_seq维度={video_seq.shape[-1]}, 预期={self.hidden_dim}。"
-                    f"请检查VideoJSCCDecoder的初始化参数。"
-                )
-            aligned_semantic = self.semantic_aligner(semantic_context)
-        else:
-            aligned_semantic = semantic_context
-        
-        if aligned_semantic.shape[0] != B:
-            raise RuntimeError(
-                f"semantic_context batch mismatch: semantic_batch={aligned_semantic.shape[0]}, expected={B}. "
-                "请检查 DataLoader/Collate 的 batch 对齐。"
-            )
-        
-        # 【修复】使用标准CrossAttention模块（与ImageJSCCDecoder保持一致）
-        # CrossAttention 内部会处理 Query 和 Key/Value 序列长度不同的情况
-        # 视频特征作为Query，语义上下文作为Key和Value
-        enhanced_video_seq, attn_weights = self.cross_attention(
-            query=video_seq,  # [B, H*W, hidden_dim]
-            guide_vector=aligned_semantic,  # [B, seq_len, hidden_dim]
-            return_attention=True
-        )
-        if attn_weights is not None:
-            self.last_semantic_gate_stats["mean"] = float(attn_weights.mean().item())
-            self.last_semantic_gate_stats["std"] = float(attn_weights.std().item())
-        
-        # 残差连接
-        enhanced_video_seq = video_seq + enhanced_video_seq
-        
-        # 重塑回视频格式
-        enhanced_video_features = enhanced_video_seq.transpose(1, 2).view(B, C, H, W)
-        
-        return enhanced_video_features
     
     def reset_hidden_state(self):
         """重置隐藏状态"""
