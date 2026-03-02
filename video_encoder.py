@@ -13,10 +13,52 @@ from torch.utils.checkpoint import checkpoint_sequential
 from typing import Optional, Tuple, List, Dict, Any
 import math
 import logging
-from image_encoder import SNRModulator
 from video_unet import ResBlock
 
 logger = logging.getLogger(__name__)
+
+
+class SNRModulator(nn.Module):
+    """SNR 自适应 FiLM 调制器。"""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        self.mlp = nn.Sequential(
+            nn.Linear(1, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, dim * 2),
+        )
+        with torch.no_grad():
+            self.mlp[-1].weight.data.zero_()
+            self.mlp[-1].bias.data.zero_()
+
+    def forward(self, x: torch.Tensor, snr_db) -> torch.Tensor:
+        b = x.shape[0]
+        if isinstance(snr_db, (float, int)):
+            snr = torch.tensor([snr_db], dtype=x.dtype, device=x.device).expand(b, 1)
+        elif isinstance(snr_db, torch.Tensor):
+            if snr_db.dim() == 0:
+                snr = snr_db.view(1, 1).expand(b, 1)
+            elif snr_db.dim() == 1:
+                snr = snr_db.view(b, 1)
+            else:
+                snr = snr_db
+        else:
+            raise ValueError("Unsupported snr_db type")
+
+        params = self.mlp(snr / 10.0)
+        scale, shift = params.chunk(2, dim=-1)
+        if x.dim() == 3:
+            scale = scale.unsqueeze(1)
+            shift = shift.unsqueeze(1)
+        elif x.dim() == 4:
+            scale = scale.unsqueeze(-1).unsqueeze(-1)
+            shift = shift.unsqueeze(-1).unsqueeze(-1)
+        return x * (1.0 + scale) + shift
+
 
 
 def _log_nonfinite(name: str, tensor: torch.Tensor) -> bool:
