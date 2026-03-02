@@ -26,6 +26,8 @@ from torchvision import transforms
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+DEPTH_MEAN = [0.5]
+DEPTH_STD = [0.5]
 
 
 def _default_image_transform(image_size: Tuple[int, int], normalize: bool) -> transforms.Compose:
@@ -37,6 +39,18 @@ def _default_image_transform(image_size: Tuple[int, int], normalize: bool) -> tr
         transform_steps.append(transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
     return transforms.Compose(transform_steps)
 
+
+
+
+def _default_depth_transform(image_size: Tuple[int, int], normalize: bool) -> transforms.Compose:
+    transform_steps = [
+        transforms.Resize(image_size),
+        transforms.ToTensor(),
+    ]
+    if normalize:
+        # 深度图为单通道，使用单通道归一化避免与 RGB 统计量维度不匹配。
+        transform_steps.append(transforms.Normalize(mean=DEPTH_MEAN, std=DEPTH_STD))
+    return transforms.Compose(transform_steps)
 
 def _default_video_transform(image_size: Tuple[int, int], normalize: bool) -> transforms.Compose:
     transform_steps = [
@@ -67,13 +81,16 @@ def _build_dynamic_sizes(
     return sorted(set(sizes))
 
 
-def _build_resize_transform(size: Tuple[int, int], normalize: bool) -> transforms.Compose:
+def _build_resize_transform(size: Tuple[int, int], normalize: bool, channels: int = 3) -> transforms.Compose:
     transform_steps = [
         transforms.Resize(size),
         transforms.ToTensor(),
     ]
     if normalize:
-        transform_steps.append(transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
+        if channels == 1:
+            transform_steps.append(transforms.Normalize(mean=DEPTH_MEAN, std=DEPTH_STD))
+        else:
+            transform_steps.append(transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
     return transforms.Compose(transform_steps)
 
 
@@ -111,6 +128,7 @@ class MultimodalDataset(Dataset):
         if image_transform is None and is_train:
             self.dynamic_image_sizes = _build_dynamic_sizes(image_size)
         self.image_transform = image_transform or _default_image_transform(image_size, normalize)
+        self.depth_transform = _default_depth_transform(image_size, normalize)
         if video_transform is None and is_train:
             self.dynamic_video_sizes = _build_dynamic_sizes(image_size)
         self.video_transform = video_transform or _default_video_transform(image_size, normalize)
@@ -134,12 +152,12 @@ class MultimodalDataset(Dataset):
             return None
         return self.random_state.choice(candidates)
 
-    def _apply_image_transform(self, image: Image.Image) -> torch.Tensor:
+    def _apply_image_transform(self, image: Image.Image, is_depth: bool = False) -> torch.Tensor:
         size = self._select_dynamic_size(self.dynamic_image_sizes)
         if size is not None:
-            transform = _build_resize_transform(size, self.normalize)
+            transform = _build_resize_transform(size, self.normalize, channels=1 if is_depth else 3)
             return transform(image)
-        return self.image_transform(image)
+        return self.depth_transform(image) if is_depth else self.image_transform(image)
 
     def _apply_video_transform(self, frame: Image.Image, size: Optional[Tuple[int, int]]) -> torch.Tensor:
         if size is not None:
@@ -153,7 +171,7 @@ class MultimodalDataset(Dataset):
     def _load_depth(self, depth_path: str) -> torch.Tensor:
         full_path = os.path.join(self.data_dir, depth_path)
         depth = Image.open(full_path).convert("L")
-        depth = self._apply_image_transform(depth)
+        depth = self._apply_image_transform(depth, is_depth=True)
         if depth.dim() == 3 and depth.size(0) != 1:
             depth = depth[:1]
         return depth

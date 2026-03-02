@@ -90,3 +90,39 @@
   - https://arxiv.org/abs/2103.14030
 - Latent Diffusion / SD-VAE（已清理的 generator 配置来源）: Rombach et al., 2022.
   - https://arxiv.org/abs/2112.10752
+
+## 三次修复（审查报告响应）
+
+11. **审查结论核验与处置**
+- 结论：审查报告关于“残留文案、语义接口误用风险、深度图归一化崩溃风险、未清理注释/死代码”的核心判断成立。
+- 处置：完成针对性清理并加固接口。
+
+12. **`multimodal_jscc.py` 文档与语义参数修复**
+- 将文件头说明改为 Depth+Video 双模态描述。
+- 在 `DepthVideoJSCC.forward` 中，调用 `VideoUNetDecoder` 时不再把 `depth_latent_rx` 塞入 `semantic_context`，避免语义接口误用。
+- 原因：`VideoUNetDecoder` 当前明确标注该参数“未使用，仅兼容”，保留该误传会制造隐藏技术债。
+
+13. **`data_loader.py` 深度图归一化通道修复（避免 DataLoader 崩溃）**
+- 新增深度图单通道统计 `DEPTH_MEAN/DEPTH_STD` 与 `_default_depth_transform`。
+- `_build_resize_transform` 增加 `channels` 参数；深度图路径走 `channels=1`，视频/RGB 路径走 `channels=3`。
+- 原因：深度图是 `convert("L")` 的单通道张量，不能应用 3 通道 ImageNet 归一化。
+
+14. **`video_encoder.py` 语义引导泛化与死代码清理**
+- 删除未被调用的 `ContextualEncoder` / `ContextualDecoder`，降低维护复杂度。
+- 将 `VideoJSCCDecoder._apply_semantic_guidance` 从“文本序列专用”改为“通用上下文”：支持 3D/4D/5D context 自动序列化后做 CrossAttention。
+- 移除 `D_text/文本编码` 等强文本措辞，改为 `D_ctx/context`。
+- 原因：避免切换到 `VideoJSCCDecoder` 时因 context 形状不匹配导致崩溃。
+
+15. **`train.py` 代码整洁**
+- 删除残留注释代码 `#if image_input is not None`。
+- 原因：确保纯 Depth+Video 训练脚本无误导性残留。
+
+## 本轮修复依据（真实链接）
+- PyTorch `transforms.Normalize`（通道数需与 tensor channel 一致）：
+  - https://pytorch.org/vision/stable/generated/torchvision.transforms.Normalize.html
+- PyTorch `nn.Linear` 输入形状约束（最后一维为 `in_features`）：
+  - https://pytorch.org/docs/stable/generated/torch.nn.Linear.html
+- PyTorch `nn.MultiheadAttention` / 注意力张量形状约束（序列建模）：
+  - https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html
+- Scaled Dot-Product Attention 理论基础：
+  - https://arxiv.org/abs/1706.03762

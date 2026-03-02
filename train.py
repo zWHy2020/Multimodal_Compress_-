@@ -556,11 +556,6 @@ def train_one_epoch(
             for key in ['loss', 'depth_loss', 'video_loss']:
                 if key in meters:
                     meters[key].clear()
-        #if image_input is not None:
-            #del image_input
-        #if video_input is not None:
-            #del video_input
-        #del device_targets
         
         # 移除torch.cuda.empty_cache()以提升训练速度
     

@@ -1,8 +1,8 @@
 """
 多模态联合信源信道编码（JSCC）主模型
 
-整合文本、图像、视频三个通路的编码器、信道和解码器。
-实现跨模态交叉注意力引导机制和端到端训练。
+整合深度图与视频双通路的编码器、信道和解码器。
+实现双模态端到端 JSCC 训练。
 """
 
 import torch
@@ -397,7 +397,7 @@ class DepthVideoJSCC(nn.Module):
         out['video_decoded'] = self.video_decoder(
             video_latent_rx,
             video_guide,
-            semantic_context=depth_latent_rx,
+            semantic_context=None,
             output_size=getattr(self.video_encoder, 'last_input_size', None),
         )
 

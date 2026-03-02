@@ -684,110 +684,6 @@ class MotionCompensation(nn.Module):
         return compensated_frame
 
 
-class ContextualEncoder(nn.Module):
-    """
-    上下文编码器
-    
-    基于DCVC的上下文编码器，移除量化模块，输出连续值特征。
-    """
-    
-    def __init__(
-        self,
-        in_channels: int = 3,
-        hidden_dim: int = 256,
-        num_layers: int = 4
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.hidden_dim = hidden_dim
-        
-        # 特征提取层
-        layers = []
-        in_ch = in_channels
-        for i in range(num_layers):
-            out_ch = hidden_dim if i < num_layers - 1 else hidden_dim
-            layers.extend([
-                nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=False)
-            ])
-            if i < num_layers - 1:
-                layers.append(nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=2, padding=1))
-            in_ch = out_ch
-        
-        self.encoder = nn.Sequential(*layers)
-        
-        # 输出投影
-        self.output_proj = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        上下文编码
-        
-        Args:
-            x (torch.Tensor): 输入帧 [B, C, H, W]
-            
-        Returns:
-            torch.Tensor: 编码特征 [B, hidden_dim, H', W']
-        """
-        features = self.encoder(x)
-        features = self.output_proj(features)
-        return features
-
-
-class ContextualDecoder(nn.Module):
-    """
-    上下文解码器
-    
-    基于DCVC的上下文解码器，从连续值特征重建帧。
-    """
-    
-    def __init__(
-        self,
-        in_channels: int = 256,
-        out_channels: int = 3,
-        hidden_dim: int = 256,
-        num_layers: int = 4
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.hidden_dim = hidden_dim
-        
-        # 输入投影
-        self.input_proj = nn.Conv2d(in_channels, hidden_dim, kernel_size=1)
-        
-        # 解码器层
-        layers = []
-        in_ch = hidden_dim
-        for i in range(num_layers):
-            out_ch = hidden_dim if i < num_layers - 1 else out_channels
-            layers.extend([
-                nn.ConvTranspose2d(in_ch, out_ch, kernel_size=3, padding=1),
-                nn.BatchNorm2d(out_ch) if i < num_layers - 1 else nn.Identity(),
-                nn.ReLU(inplace=False) if i < num_layers - 1 else nn.Sigmoid()
-            ])
-            if i < num_layers - 1:
-                layers.append(nn.ConvTranspose2d(out_ch, out_ch, kernel_size=3, stride=2, padding=1, output_padding=1))
-            in_ch = out_ch
-        
-        self.decoder = nn.Sequential(*layers)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        上下文解码
-        
-        Args:
-            x (torch.Tensor): 输入特征 [B, in_channels, H, W]
-            
-        Returns:
-            torch.Tensor: 重建帧 [B, out_channels, H', W']
-        """
-        x = self.input_proj(x)
-        x = self.decoder(x)
-        return x
-
-
 class VideoJSCCEncoder(nn.Module):
     """
     视频JSCC编码器
@@ -1046,8 +942,7 @@ class VideoJSCCDecoder(nn.Module):
         )
         
         # 语义对齐层：在 __init__ 中预定义，而不是在 forward 中动态创建
-        # 用于将语义上下文（文本编码）的维度对齐到视频特征的维度
-        # 文本编码维度：semantic_context_dim (例如 256)
+        # 用于将语义上下文维度对齐到视频特征维度
         # 视频特征维度：hidden_dim (例如 256)
         self.semantic_aligner = nn.Linear(semantic_context_dim, hidden_dim)
         
@@ -1079,7 +974,7 @@ class VideoJSCCDecoder(nn.Module):
             noisy_features (torch.Tensor): 带噪特征 [B, T(+1), C, H, W]
             guide_vectors (torch.Tensor): 引导向量 [B, T, guide_dim]
             reset_state (bool): 是否重置隐藏状态
-            semantic_context (torch.Tensor, optional): 语义上下文 [B, seq_len, D_text]
+            semantic_context (torch.Tensor, optional): 语义上下文 [B, seq_len, D_ctx] 或空间张量
             
         Returns:
             torch.Tensor: 重建视频 [B, T, C, H, W]
@@ -1162,7 +1057,7 @@ class VideoJSCCDecoder(nn.Module):
         
         Args:
             video_features (torch.Tensor): 视频特征 [B, C, H, W]
-            semantic_context (torch.Tensor): 语义上下文 [B, seq_len, D_text]
+            semantic_context (torch.Tensor): 语义上下文 [B, seq_len, D_ctx] 或 [B, C, H, W]
             
         Returns:
             torch.Tensor: 增强后的视频特征
@@ -1172,16 +1067,23 @@ class VideoJSCCDecoder(nn.Module):
         # 将视频特征重塑为序列格式
         video_seq = video_features.view(B, C, -1).transpose(1, 2)  # [B, H*W, C]
         
-        # 维度对齐
-        # 注意：semantic_aligner 已在 __init__ 中定义，不应在 forward 中动态创建
-        # 如果维度不匹配，使用预定义的语义对齐层
-        if video_seq.shape[-1] != semantic_context.shape[-1]:
-            # 验证维度是否与预定义的对齐层匹配
-            if (semantic_context.shape[-1] != self.semantic_context_dim or 
-                video_seq.shape[-1] != self.hidden_dim):
+        # 将上下文统一到序列格式 [B, L, D]
+        if semantic_context.dim() == 4:
+            semantic_context = semantic_context.flatten(2).transpose(1, 2)  # [B, H*W, C]
+        elif semantic_context.dim() == 5:
+            semantic_context = semantic_context.permute(0, 1, 3, 4, 2).reshape(
+                semantic_context.size(0), -1, semantic_context.size(2)
+            )  # [B, T*H*W, C]
+        elif semantic_context.dim() != 3:
+            raise RuntimeError(
+                f"semantic_context 维度不支持: got {semantic_context.dim()}, expected 3/4/5."
+            )
+
+        if semantic_context.shape[-1] != self.hidden_dim:
+            if semantic_context.shape[-1] != self.semantic_context_dim:
                 raise RuntimeError(
                     f"语义对齐层维度不匹配："
-                    f"semantic_context维度={semantic_context.shape[-1]}, 预期={self.semantic_context_dim}; "
+                    f"context维度={semantic_context.shape[-1]}, 预期={self.semantic_context_dim}; "
                     f"video_seq维度={video_seq.shape[-1]}, 预期={self.hidden_dim}。"
                     f"请检查VideoJSCCDecoder的初始化参数。"
                 )
