@@ -397,7 +397,6 @@ class DepthVideoJSCC(nn.Module):
         out['video_decoded'] = self.video_decoder(
             video_latent_rx,
             video_guide,
-            semantic_context=None,
             output_size=getattr(self.video_encoder, 'last_input_size', None),
         )
 

@@ -1,7 +1,7 @@
 """
 多模态JSCC训练脚本
 
-实现完整的训练-验证循环，支持文本、图像、视频三种模态的联合训练。
+实现完整的训练-验证循环，支持深度图与视频双模态联合训练。
 参考 main.py 的训练框架，适配多模态模型接口和数据加载器。
 """
 
@@ -242,7 +242,6 @@ def train_one_epoch(
         'adversarial_loss': AverageMeter(),
         'disc_loss_real': AverageMeter(),
         'disc_loss_fake': AverageMeter(),
-        'video_semantic_gate_mean': AverageMeter(),
         'time': AverageMeter()
     }
 
@@ -519,9 +518,7 @@ def train_one_epoch(
             meters['disc_loss_real'].update(disc_loss_real_value)
         if disc_loss_fake_value is not None:
             meters['disc_loss_fake'].update(disc_loss_fake_value)
-        if results.get("video_semantic_gate_mean") is not None:
-            meters['video_semantic_gate_mean'].update(results.get("video_semantic_gate_mean", 0.0))
-        
+
         # 修复OOM：在更新指标后立即清理中间变量
         del results, loss_dict, total_loss
         
@@ -915,7 +912,7 @@ def main():
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=getattr(config, 'ddp_find_unused_parameters', True)
+            find_unused_parameters=getattr(config, 'ddp_find_unused_parameters', False)
         )
     config.print_config(logger)
     print_model_structure_info(unwrap_model(model), logger)
@@ -957,7 +954,7 @@ def main():
                 discriminator,
                 device_ids=[local_rank],
                 output_device=local_rank,
-                find_unused_parameters=getattr(config, 'ddp_find_unused_parameters', True)
+                find_unused_parameters=getattr(config, 'ddp_find_unused_parameters', False)
             )
         optimizer_d = optim.Adam(
             discriminator.parameters(),
@@ -1255,4 +1252,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
