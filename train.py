@@ -43,16 +43,6 @@ def create_model(config: TrainingConfig) -> DepthVideoJSCC:
             #standard_dims = [96, 192, 384, 768]
             #standard_depths = [2, 2, 6, 2]
             #standard_heads = [3, 6, 12, 24]
-            #if config.img_embed_dims != standard_dims:
-                #print(f"【自动修正】检测到预训练模型，将 embed_dims 从 {config.img_embed_dims} 修正为 {standard_dims}")
-                #config.img_embed_dims = standard_dims    
-            #if config.img_depths != standard_depths:
-                #config.img_depths = standard_depths
-            #if config.img_num_heads != standard_heads:
-                #config.img_num_heads = standard_heads
-            #if config.img_depths != standard_depths:
-                #print(f"正在强制修正 config.img_depths 为 {standard_depths} 以匹配预训练模型。")
-                #config.img_depths = standard_depths
     """创建深度图+视频双模态JSCC模型"""
     model = DepthVideoJSCC(
         img_size=config.img_size,
@@ -223,7 +213,7 @@ def _compute_r1_penalty(d_out: torch.Tensor, real_input: torch.Tensor) -> torch.
 def train_one_epoch(
     model: DepthVideoJSCC,
     train_loader: DataLoader,
-    loss_fn: MultimodalLoss,
+    loss_fn: DepthVideoLoss,
     optimizer: optim.Optimizer,
     config: TrainingConfig,
     epoch: int,
@@ -246,12 +236,9 @@ def train_one_epoch(
         'loss': AverageMeter(),
         'depth_loss': AverageMeter(),
         'video_loss': AverageMeter(),
-        'image_recon_loss': AverageMeter(),
-        'image_percep_loss': AverageMeter(),
         'video_recon_loss': AverageMeter(),
         'video_percep_loss': AverageMeter(),
         'video_temporal_loss': AverageMeter(),
-        'condition_margin_loss': AverageMeter(),
         'adversarial_loss': AverageMeter(),
         'disc_loss_real': AverageMeter(),
         'disc_loss_fake': AverageMeter(),
@@ -355,15 +342,10 @@ def train_one_epoch(
                 for p in discriminator.parameters():
                     p.requires_grad = False
 
-                image_disc_pred = None
                 video_disc_pred = None
-                if 'image_decoded' in results:
-                    image_disc_pred, _ = discriminator(image=results['image_decoded'])
                 if 'video_decoded' in results:
                     _, video_disc_pred = discriminator(video=results['video_decoded'])
                 discriminator_outputs = {}
-                if image_disc_pred is not None:
-                    discriminator_outputs['image'] = image_disc_pred
                 if video_disc_pred is not None:
                     discriminator_outputs['video'] = video_disc_pred
                 for p in discriminator.parameters():
@@ -479,14 +461,6 @@ def train_one_epoch(
                     disc_loss_fake = torch.tensor(0.0, device=device)
                     r1_penalty = torch.tensor(0.0, device=device)
                     with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                        if 'image' in device_targets:
-                            real_image = device_targets['image']
-                            if use_r1:
-                                real_image = real_image.requires_grad_(True)
-                            real_img_pred, _ = discriminator(image=real_image)
-                            disc_loss_real = disc_loss_real + adv_loss_fn(real_img_pred, target_is_real=True)
-                            if use_r1:
-                                r1_penalty = r1_penalty + _compute_r1_penalty(real_img_pred, real_image)
                         if 'video' in device_targets:
                             real_video = device_targets['video']
                             if use_r1:
@@ -495,9 +469,6 @@ def train_one_epoch(
                             disc_loss_real = disc_loss_real + adv_loss_fn(video_real_pred, target_is_real=True)
                             if use_r1:
                                 r1_penalty = r1_penalty + _compute_r1_penalty(video_real_pred, real_video)
-                        if 'image_decoded' in results:
-                            image_fake_pred, _ = discriminator(image=results['image_decoded'].detach())
-                            disc_loss_fake = disc_loss_fake + adv_loss_fn(image_fake_pred, target_is_real=False)
                         if 'video_decoded' in results:
                             _, video_fake_pred = discriminator(video=results['video_decoded'].detach())
                             disc_loss_fake = disc_loss_fake + adv_loss_fn(video_fake_pred, target_is_real=False)
@@ -534,16 +505,6 @@ def train_one_epoch(
         loss_value = loss_dict['total_loss'].item()
         meters['loss'].update(loss_value)
         
-        if 'text_loss' in loss_dict:
-            meters['text_loss'].update(loss_dict.get('text_loss', 0.0))
-        if 'image_loss' in loss_dict:
-            meters['image_loss'].update(loss_dict.get('image_loss', 0.0))
-        if 'video_loss' in loss_dict:
-            meters['video_loss'].update(loss_dict.get('video_loss', 0.0))
-        if 'image_recon_loss' in loss_dict:
-            meters['image_recon_loss'].update(loss_dict.get('image_recon_loss', 0.0))
-        if 'image_percep_loss' in loss_dict:
-            meters['image_percep_loss'].update(loss_dict.get('image_percep_loss', 0.0))
         if 'video_recon_loss_l1' in loss_dict:
             meters['video_recon_loss'].update(loss_dict.get('video_recon_loss_l1', 0.0))
         if 'video_percep_loss' in loss_dict:
@@ -595,8 +556,6 @@ def train_one_epoch(
             for key in ['loss', 'depth_loss', 'video_loss']:
                 if key in meters:
                     meters[key].clear()
-        #if text_input is not None:
-            #del text_input
         #if image_input is not None:
             #del image_input
         #if video_input is not None:
@@ -615,7 +574,7 @@ def train_one_epoch(
 def validate(
     model: DepthVideoJSCC,
     val_loader: DataLoader,
-    loss_fn: MultimodalLoss,
+    loss_fn: DepthVideoLoss,
     config: TrainingConfig,
     epoch: int,
     logger: logging.Logger,
@@ -641,7 +600,6 @@ def validate(
         'loss': AverageMeter(),
         'depth_loss': AverageMeter(),
         'video_loss': AverageMeter(),
-        'image_psnr': AverageMeter(),
         'time': AverageMeter()
     }
     
@@ -714,8 +672,6 @@ def main():
     )
     parser.add_argument('--train-snr-min', type=float, default=None, help='训练随机SNR最小值')
     parser.add_argument('--train-snr-max', type=float, default=None, help='训练随机SNR最大值')
-    parser.add_argument('--use-text-guidance-image', action='store_true', help='启用文本语义引导图像重建')
-    parser.add_argument('--use-text-guidance-video', action='store_true', help='启用文本语义引导视频重建')
     parser.add_argument(
         '--video-sampling-strategy',
         type=str,
@@ -766,29 +722,6 @@ def main():
         default=None,
         help='启用梯度检查点以节省显存',
     )
-    parser.add_argument(
-        '--image-decoder-type',
-        type=str,
-        choices=['baseline', 'generative'],
-        default=None,
-        help='图像解码器类型',
-    )
-    parser.add_argument(
-        '--generator-type',
-        type=str,
-        default=None,
-        help='生成器类型（默认vae）',
-    )
-    parser.add_argument(
-        '--generator-ckpt',
-        type=str,
-        default=None,
-        help='生成器权重路径（VAE等）',
-    )
-    parser.add_argument('--z-channels', type=int, default=None, help='生成器latent通道数')
-    parser.add_argument('--latent-down', type=int, default=None, help='生成器latent下采样倍率')
-    parser.add_argument('--generative-gamma1', type=float, default=None, help='生成式图像MSE权重')
-    parser.add_argument('--generative-gamma2', type=float, default=None, help='生成式图像LPIPS权重')
     parser.add_argument('--use-omib-like', action=argparse.BooleanOptionalAction, default=None, help='启用OMIB-like损失项')
     parser.add_argument('--ib-beta', type=float, default=None, help='OMIB-like KL权重beta')
     parser.add_argument('--ib-beta-min', type=float, default=None, help='OMIB-like beta下界')
@@ -868,20 +801,6 @@ def main():
         config.use_amp = args.use_amp
     if args.use_gradient_checkpointing is not None:
         config.use_gradient_checkpointing = args.use_gradient_checkpointing
-    if args.image_decoder_type:
-        config.image_decoder_type = args.image_decoder_type
-    if args.generator_type:
-        config.generator_type = args.generator_type
-    if args.generator_ckpt:
-        config.generator_ckpt = args.generator_ckpt
-    if args.z_channels is not None:
-        config.z_channels = args.z_channels
-    if args.latent_down is not None:
-        config.latent_down = args.latent_down
-    if args.generative_gamma1 is not None:
-        config.generative_gamma1 = args.generative_gamma1
-    if args.generative_gamma2 is not None:
-        config.generative_gamma2 = args.generative_gamma2
     if args.use_omib_like is not None:
         config.use_omib_like = args.use_omib_like
     if args.ib_beta is not None:
@@ -911,10 +830,6 @@ def main():
         config.train_snr_min = args.train_snr_min
     if args.train_snr_max is not None:
         config.train_snr_max = args.train_snr_max
-    if args.use_text_guidance_image:
-        config.use_text_guidance_image = True
-    if args.use_text_guidance_video:
-        config.use_text_guidance_video = True
     
     # 配置日志
     if is_main_process:
@@ -942,7 +857,6 @@ def main():
     logger.info(f"数据目录: {config.data_dir}")
     logger.info(f"训练清单: {config.train_manifest}")
     logger.info(f"验证清单: {config.val_manifest}")
-    logger.info(f"图像解码器类型: {getattr(config, 'image_decoder_type', 'baseline')}")
     logger.info(
         "视频采样设置: clip_len=%d stride=%d train_strategy=%s val_strategy=%s",
         config.video_clip_len,
@@ -983,17 +897,11 @@ def main():
         if not data_list:
             return
         vids = set()
-        captions = []
-        keyframes = []
         for item in data_list:
             vid = item.get("meta", {}).get("video_id") or os.path.basename(item.get("video", {}).get("file", ""))
             if vid:
                 vids.add(vid)
-            text_info = item.get("text", {})
-            captions.append(len(text_info.get("texts", [])) if "texts" in text_info else (1 if "text" in text_info else 0))
-            image_info = item.get("image", {})
-            keyframes.append(len(image_info.get("files", [])) if "files" in image_info else (1 if "file" in image_info else 0))
-        logger.info(f"{name} unique videos: {len(vids)}, captions/vid mean={np.mean(captions):.2f}, keyframes/vid mean={np.mean(keyframes):.2f}")
+        logger.info(f"{name} unique videos: {len(vids)}")
     _log_manifest_stats("训练", train_data_list)
     _log_manifest_stats("验证", val_data_list)
     
@@ -1022,27 +930,8 @@ def main():
         #state_dict = checkpoint['model_state_dict']
         #if not check_state_dict_compatibility(model, state_dict, logger):
             #logger.error("检测到维度不匹配，终止训练以防止错误传播！")
-            #logger.error("请检查 config.py 中的 img_embed_dims 是否与 checkpoint 中的一致。")
             #sys.exit(1)
         #model.load_state_dict(state_dict)
-    
-    # 【Phase 1】如果启用预训练，记录信息
-    if getattr(config, 'pretrained', False):
-        real_model = unwrap_model(model)
-        image_encoder = getattr(real_model, "image_encoder", None)
-        image_pretrained_active = bool(getattr(image_encoder, "pretrained", False))
-        if image_pretrained_active:
-            logger.info(
-                "【Phase 1】使用预训练权重: "
-                f"{getattr(config, 'pretrained_model_name', 'swin_tiny_patch4_window7_224')}"
-            )
-            if getattr(config, 'freeze_encoder', False):
-                logger.info("【Phase 1】编码器主干已冻结，仅训练适配器层")
-        else:
-            logger.info(
-                "【Phase 1】预训练权重在配置中启用，但当前图像编码器未加载预训练权重，"
-                "将使用随机初始化。"
-            )
     
     # 打印模型信息
     total_params = sum(p.numel() for p in model.parameters())
@@ -1063,7 +952,6 @@ def main():
         logger.info("创建判别器...")
         from discriminator import MultimodalDiscriminator
         discriminator = MultimodalDiscriminator(
-            image_input_nc=3,
             video_input_nc=3,
             ndf=64,
             n_layers=3
@@ -1106,7 +994,6 @@ def main():
         num_workers=config.num_workers,
         shuffle=True,
         image_size=config.img_size,
-        max_text_length=config.max_text_length,
         max_video_frames=config.max_video_frames,
         video_clip_len=config.video_clip_len,
         video_stride=config.video_stride,
@@ -1115,7 +1002,7 @@ def main():
         prefetch_factor=getattr(config, 'prefetch_factor', 2),
         allow_missing_modalities=getattr(config, "allow_missing_modalities", False),
         strict_mode=getattr(config, "strict_data_loading", True),
-        required_modalities=("video", "text"),
+        required_modalities=("video", "depth"),
         normalize=getattr(config, "normalize", False),
         seed=config.seed,
     )
@@ -1126,7 +1013,7 @@ def main():
     collate_fn = partial(
         collate_multimodal_batch,
         allow_missing_modalities=data_loader_manager.allow_missing_modalities,
-        required_modalities=("video", "text"),
+        required_modalities=("video", "depth"),
     )
     if is_distributed:
         train_sampler = DistributedSampler(train_dataset)
@@ -1226,17 +1113,8 @@ def main():
     
     # 保存模型配置到检查点
     model_config = {
-        'vocab_size': config.vocab_size,
-        'text_embed_dim': config.text_embed_dim,
-        'text_num_heads': config.text_num_heads,
-        'text_num_layers': config.text_num_layers,
-        'text_output_dim': config.text_output_dim,
         'img_size': config.img_size,
         'patch_size': config.patch_size,
-        'img_embed_dims': config.img_embed_dims,
-        'img_depths': config.img_depths,
-        'img_num_heads': config.img_num_heads,
-        'img_output_dim': config.img_output_dim,
         'video_hidden_dim': config.video_hidden_dim,
         'video_num_frames': config.video_num_frames,
         'video_use_optical_flow': config.video_use_optical_flow,
@@ -1245,14 +1123,6 @@ def main():
         'video_gop_size': getattr(config, "video_gop_size", None),
         'channel_type': config.channel_type,
         'normalize_inputs': getattr(config, "normalize", False),
-        'pretrained': getattr(config, 'pretrained', False),
-        'freeze_encoder': getattr(config, 'freeze_encoder', False),
-        'pretrained_model_name': getattr(config, 'pretrained_model_name', None),
-        'image_decoder_type': getattr(config, 'image_decoder_type', 'baseline'),
-        'generator_type': getattr(config, 'generator_type', 'vae'),
-        'generator_ckpt': getattr(config, 'generator_ckpt', None),
-        'z_channels': getattr(config, 'z_channels', 4),
-        'latent_down': getattr(config, 'latent_down', 8),
         'video_clip_len': config.video_clip_len,
         'video_stride': config.video_stride,
         'video_sampling_strategy': config.video_sampling_strategy,
@@ -1346,14 +1216,8 @@ def main():
             )
             
             # 打印详细指标
-            if 'image_psnr' in val_metrics:
-                logger.info(f"图像 PSNR: {val_metrics['image_psnr']:.2f} dB")
-            if 'image_ssim' in val_metrics:
-                logger.info(f"图像 SSIM: {val_metrics['image_ssim']:.4f}")
             if 'video_psnr_mean' in val_metrics:
                 logger.info(f"视频平均 PSNR: {val_metrics['video_psnr_mean']:.2f} dB")
-            if 'text_bleu' in val_metrics:
-                logger.info(f"文本 BLEU: {val_metrics['text_bleu']:.4f}")
             # 保存最佳模型
             if is_main_process and val_metrics['loss'] < best_val_loss:
                 best_val_loss = val_metrics['loss']
