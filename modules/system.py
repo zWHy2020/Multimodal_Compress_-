@@ -6,13 +6,19 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from channel import Channel
-from video_encoder import VideoJSCCEncoder
-from video_unet import VideoUNetDecoder
+from .channel_models import BaseChannel, DefaultChannel
+from .depth_models import BaseDepthDecoder, BaseDepthEncoder, DefaultDepthDecoder, DefaultDepthEncoder
+from .fusion_models import (
+    BaseEntropyModel,
+    BaseJointFusion,
+    BaseMineEstimator,
+    DefaultEntropyModel,
+    DefaultJointFusion,
+    DefaultMineEstimator,
+)
+from .video_codec import BaseVideoDecoder, BaseVideoEncoder, DefaultVideoDecoder, DefaultVideoEncoder
 
 from .api import ModelForwardOutput
-from .depth_codec import DepthJSCCDecoder, DepthJSCCEncoder
-from .fusion import JointEntropyModel, JointLatentFusion, MineEstimator
 
 
 class DepthVideoJSCC(nn.Module):
@@ -34,11 +40,19 @@ class DepthVideoJSCC(nn.Module):
         omib_eps: float = 1e-6,
         enable_mi_correction: bool = True,
         mine_hidden_dim: int = 128,
+        depth_encoder: Optional[BaseDepthEncoder] = None,
+        depth_decoder: Optional[BaseDepthDecoder] = None,
+        video_encoder: Optional[BaseVideoEncoder] = None,
+        video_decoder: Optional[BaseVideoDecoder] = None,
+        channel: Optional[BaseChannel] = None,
+        joint_fusion: Optional[BaseJointFusion] = None,
+        entropy_model: Optional[BaseEntropyModel] = None,
+        mine_estimator: Optional[BaseMineEstimator] = None,
     ):
         super().__init__()
-        self.depth_encoder = DepthJSCCEncoder(output_dim=depth_output_dim)
-        self.depth_decoder = DepthJSCCDecoder(input_dim=depth_output_dim)
-        self.video_encoder = VideoJSCCEncoder(
+        self.depth_encoder = depth_encoder or DefaultDepthEncoder(output_dim=depth_output_dim)
+        self.depth_decoder = depth_decoder or DefaultDepthDecoder(input_dim=depth_output_dim)
+        self.video_encoder = video_encoder or DefaultVideoEncoder(
             hidden_dim=video_hidden_dim,
             num_frames=video_num_frames,
             output_dim=video_output_dim,
@@ -47,20 +61,22 @@ class DepthVideoJSCC(nn.Module):
             img_size=img_size,
             patch_size=patch_size,
         )
-        self.video_decoder = VideoUNetDecoder(in_channels=video_output_dim, out_channels=3)
+        self.video_decoder = video_decoder or DefaultVideoDecoder(in_channels=video_output_dim, out_channels=3)
 
-        self.joint_fusion = JointLatentFusion(
+        self.joint_fusion = joint_fusion or DefaultJointFusion(
             depth_dim=depth_output_dim,
             video_dim=video_output_dim,
             shared_dim=shared_latent_dim,
         )
-        self.entropy_model = JointEntropyModel()
+        self.entropy_model = entropy_model or DefaultEntropyModel()
 
-        self.channel = Channel(channel_type=channel_type, snr_db=snr_db, power_normalization=power_normalization)
+        self.channel = channel or DefaultChannel(channel_type=channel_type, snr_db=snr_db, power_normalization=power_normalization)
         self.enable_omib_stats = bool(enable_omib_stats)
         self.omib_eps = float(omib_eps)
         self.enable_mi_correction = bool(enable_mi_correction)
-        self.mine_estimator = MineEstimator(depth_output_dim, video_output_dim, hidden_dim=mine_hidden_dim) if self.enable_mi_correction else None
+        self.mine_estimator = (
+            mine_estimator or DefaultMineEstimator(depth_output_dim, video_output_dim, hidden_dim=mine_hidden_dim)
+        ) if self.enable_mi_correction else None
 
         self.power_normalizer = nn.ModuleDict()
         if power_normalization:
@@ -108,8 +124,8 @@ class DepthVideoJSCC(nn.Module):
         depth_private_tx = self.channel(self._norm_feature(fused['depth_private'], 'depth'))
         video_private_tx = self.channel(self._norm_feature(fused['video_private'], 'video'))
 
-        depth_shared_rx = self.joint_fusion.shared_to_depth(shared_tx).unsqueeze(-1).unsqueeze(-1).expand_as(depth_private_tx)
-        video_shared_rx = self.joint_fusion.shared_to_video(shared_tx).unsqueeze(1).unsqueeze(-1).unsqueeze(-1).expand_as(video_private_tx)
+        depth_shared_rx = self.joint_fusion.project_shared_to_depth(shared_tx, like=depth_private_tx)
+        video_shared_rx = self.joint_fusion.project_shared_to_video(shared_tx, like=video_private_tx)
 
         depth_latent_rx = depth_shared_rx + depth_private_tx
         video_latent_rx = video_shared_rx + video_private_tx
