@@ -2,7 +2,16 @@
 
 from modules.channel_models import BaseChannel, DefaultChannel
 from modules.depth_codec import DepthJSCCDecoder, DepthJSCCEncoder
+from modules.depth_models import BaseDepthDecoder, BaseDepthEncoder, DefaultDepthDecoder, DefaultDepthEncoder
 from modules.fusion import JointEntropyModel, JointLatentFusion, MineEstimator
+from modules.fusion_models import (
+    BaseEntropyModel,
+    BaseJointFusion,
+    BaseMineEstimator,
+    DefaultEntropyModel,
+    DefaultJointFusion,
+    DefaultMineEstimator,
+)
 from modules.gating import BandwidthMask, ConditionalBandwidthGate
 from modules.quantization import VectorQuantizer
 from modules.video_codec import BaseVideoDecoder, BaseVideoEncoder, DefaultVideoDecoder, DefaultVideoEncoder
@@ -14,10 +23,20 @@ __all__ = [
     'BandwidthMask',
     'ConditionalBandwidthGate',
     'VectorQuantizer',
+    'BaseDepthEncoder',
+    'BaseDepthDecoder',
+    'DefaultDepthEncoder',
+    'DefaultDepthDecoder',
     'BaseVideoEncoder',
     'BaseVideoDecoder',
     'DefaultVideoEncoder',
     'DefaultVideoDecoder',
+    'BaseJointFusion',
+    'BaseEntropyModel',
+    'BaseMineEstimator',
+    'DefaultJointFusion',
+    'DefaultEntropyModel',
+    'DefaultMineEstimator',
     'DepthJSCCEncoder',
     'DepthJSCCDecoder',
     'JointLatentFusion',
