@@ -6,9 +6,8 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from channel import Channel
-from video_encoder import VideoJSCCEncoder
-from video_unet import VideoUNetDecoder
+from .channel_models import BaseChannel, DefaultChannel
+from .video_codec import BaseVideoDecoder, BaseVideoEncoder, DefaultVideoDecoder, DefaultVideoEncoder
 
 from .api import ModelForwardOutput
 from .depth_codec import DepthJSCCDecoder, DepthJSCCEncoder
@@ -34,11 +33,14 @@ class DepthVideoJSCC(nn.Module):
         omib_eps: float = 1e-6,
         enable_mi_correction: bool = True,
         mine_hidden_dim: int = 128,
+        video_encoder: Optional[BaseVideoEncoder] = None,
+        video_decoder: Optional[BaseVideoDecoder] = None,
+        channel: Optional[BaseChannel] = None,
     ):
         super().__init__()
         self.depth_encoder = DepthJSCCEncoder(output_dim=depth_output_dim)
         self.depth_decoder = DepthJSCCDecoder(input_dim=depth_output_dim)
-        self.video_encoder = VideoJSCCEncoder(
+        self.video_encoder = video_encoder or DefaultVideoEncoder(
             hidden_dim=video_hidden_dim,
             num_frames=video_num_frames,
             output_dim=video_output_dim,
@@ -47,7 +49,7 @@ class DepthVideoJSCC(nn.Module):
             img_size=img_size,
             patch_size=patch_size,
         )
-        self.video_decoder = VideoUNetDecoder(in_channels=video_output_dim, out_channels=3)
+        self.video_decoder = video_decoder or DefaultVideoDecoder(in_channels=video_output_dim, out_channels=3)
 
         self.joint_fusion = JointLatentFusion(
             depth_dim=depth_output_dim,
@@ -56,7 +58,7 @@ class DepthVideoJSCC(nn.Module):
         )
         self.entropy_model = JointEntropyModel()
 
-        self.channel = Channel(channel_type=channel_type, snr_db=snr_db, power_normalization=power_normalization)
+        self.channel = channel or DefaultChannel(channel_type=channel_type, snr_db=snr_db, power_normalization=power_normalization)
         self.enable_omib_stats = bool(enable_omib_stats)
         self.omib_eps = float(omib_eps)
         self.enable_mi_correction = bool(enable_mi_correction)
