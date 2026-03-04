@@ -1,8 +1,4 @@
-"""
-多模态JSCC评估指标
-
-实现PSNR、SSIM、BLEU、ROUGE等评估指标。
-"""
+"""多模态JSCC评估指标（视频+深度优先）。"""
 
 import torch
 import torch.nn.functional as F
@@ -257,6 +253,38 @@ def calculate_rouge_l(
     }
 
 
+def calculate_depth_metrics(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> Dict[str, float]:
+    """Depth metrics commonly used in monocular/depth reconstruction literature.
+
+    Returns: AbsRel, SqRel, RMSE, RMSE(log), delta1/2/3.
+    """
+    pred = pred.float().clamp_min(eps)
+    target = target.float().clamp_min(eps)
+
+    abs_diff = torch.abs(pred - target)
+    sq_diff = (pred - target) ** 2
+
+    abs_rel = (abs_diff / target).mean()
+    sq_rel = (sq_diff / target).mean()
+    rmse = torch.sqrt(sq_diff.mean())
+    rmse_log = torch.sqrt(((torch.log(pred) - torch.log(target)) ** 2).mean())
+
+    ratio = torch.maximum(pred / target, target / pred)
+    delta1 = (ratio < 1.25).float().mean()
+    delta2 = (ratio < (1.25 ** 2)).float().mean()
+    delta3 = (ratio < (1.25 ** 3)).float().mean()
+
+    return {
+        'depth_abs_rel': abs_rel.item(),
+        'depth_sq_rel': sq_rel.item(),
+        'depth_rmse': rmse.item(),
+        'depth_rmse_log': rmse_log.item(),
+        'depth_delta1': delta1.item(),
+        'depth_delta2': delta2.item(),
+        'depth_delta3': delta3.item(),
+    }
+
+
 def _normalize_image_range(
     img: torch.Tensor,
     target_range: Tuple[float, float] = (0.0, 1.0),
@@ -383,7 +411,8 @@ def calculate_multimodal_metrics(
     attention_mask: Optional[torch.Tensor] = None,
     imagenet_normalized: bool = False,
     imagenet_mean: Optional[List[float]] = None,
-    imagenet_std: Optional[List[float]] = None
+    imagenet_std: Optional[List[float]] = None,
+    include_text_metrics: bool = False,
 ) -> Dict[str, float]:
     """
     计算多模态评估指标
@@ -493,8 +522,25 @@ def calculate_multimodal_metrics(
             metrics['video_psnr_std'] = 0.0
             metrics['video_ssim_std'] = 0.0
     
-    # 文本指标（需要转换为token序列）
-    if 'text_decoded' in predictions and 'text' in targets:
+    # 深度指标
+    if 'depth_decoded' in predictions and 'depth' in targets:
+        try:
+            depth_metrics = calculate_depth_metrics(predictions['depth_decoded'], targets['depth'])
+            metrics.update(depth_metrics)
+        except Exception as e:
+            print(f"警告: 计算深度指标时出错: {e}")
+            metrics.update({
+                'depth_abs_rel': 0.0,
+                'depth_sq_rel': 0.0,
+                'depth_rmse': 0.0,
+                'depth_rmse_log': 0.0,
+                'depth_delta1': 0.0,
+                'depth_delta2': 0.0,
+                'depth_delta3': 0.0,
+            })
+
+    # 文本指标默认关闭（当前仓库主任务为视频+深度）
+    if include_text_metrics and 'text_decoded' in predictions and 'text' in targets:
         pred_text = predictions['text_decoded']
         target_text = targets['text']
         
