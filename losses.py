@@ -1,5 +1,10 @@
-"""
-Depth + Video JSCC losses.
+"""Depth + Video JSCC losses.
+
+Updated with an RD + Perception + Geometry stack:
+- Video RD: Charbonnier reconstruction
+- Video perception: optional 3D spatiotemporal feature loss
+- GAN: Hinge objective (+ optional R1 regularization helper)
+- Depth: SILog + gradient + normal consistency
 """
 
 import math
@@ -88,6 +93,67 @@ class PerceptualLoss(nn.Module):
         return loss
 
 
+class SpatiotemporalPerceptualLoss(nn.Module):
+    """3D spatiotemporal perceptual loss for video sequences.
+
+    Uses a frozen 3D feature extractor. If torchvision video backbones are
+    unavailable, falls back to a lightweight frozen 3D conv stack.
+    """
+
+    def __init__(self, feature_weight: float = 1.0):
+        super().__init__()
+        self.feature_weight = feature_weight
+        self.use_torchvision_3d = False
+        self.backbone = None
+
+        try:
+            tv = torch.hub.load('pytorch/vision:v0.14.1', 'r3d_18', pretrained=True)
+            tv.eval()
+            self.backbone = nn.Sequential(*list(tv.children())[:-1])
+            self.use_torchvision_3d = True
+        except Exception:
+            # Fallback: lightweight frozen 3D encoder
+            self.backbone = nn.Sequential(
+                nn.Conv3d(3, 32, kernel_size=3, stride=1, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv3d(32, 64, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv3d(64, 128, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool3d((1, 1, 1)),
+            )
+
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+    def forward(self, pred_video: torch.Tensor, target_video: torch.Tensor) -> torch.Tensor:
+        # Input: [B, T, C, H, W] -> [B, C, T, H, W]
+        pred_3d = pred_video.permute(0, 2, 1, 3, 4)
+        target_3d = target_video.permute(0, 2, 1, 3, 4)
+        pred_feat = self.backbone(pred_3d)
+        target_feat = self.backbone(target_3d)
+        return self.feature_weight * F.mse_loss(pred_feat, target_feat)
+
+
+class R1Regularizer(nn.Module):
+    """R1 gradient regularization for discriminator stability."""
+
+    def __init__(self, gamma: float = 10.0):
+        super().__init__()
+        self.gamma = gamma
+
+    def forward(self, real_scores: torch.Tensor, real_inputs: torch.Tensor) -> torch.Tensor:
+        grad_real = torch.autograd.grad(
+            outputs=real_scores.sum(),
+            inputs=real_inputs,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        grad_penalty = grad_real.pow(2).reshape(real_inputs.size(0), -1).sum(1).mean()
+        return 0.5 * self.gamma * grad_penalty
+
+
 class VideoLoss(nn.Module):
     """
     视频损失 (轻量级优化版)
@@ -101,6 +167,7 @@ class VideoLoss(nn.Module):
         temporal_weight: float = 0.1,
         temporal_consistency_weight: float = 0.0,
         temporal_perceptual_weight: float = 0.0,
+        spatiotemporal_perceptual_weight: float = 0.0,
         color_consistency_weight: float = 0.0,
         data_range: float = 1.0,
         normalize: bool = False,
@@ -112,19 +179,23 @@ class VideoLoss(nn.Module):
         self.temp_weight = temporal_weight
         self.consistency_weight = temporal_consistency_weight
         self.temporal_perceptual_weight = temporal_perceptual_weight
+        self.spatiotemporal_perceptual_weight = spatiotemporal_perceptual_weight
         self.color_consistency_weight = color_consistency_weight
         self.data_range = data_range
         self.normalize = normalize
         #self.epsilon = 1e-6
         
-        # 重建损失 (L1)
-        self.recon_loss_fn = nn.L1Loss()
+        # 重建损失（Charbonnier）
+        self.charbonnier_eps = 1e-3
         
         # 感知损失（LPIPS或VGG）
         if self.percep_weight > 0:
             self.percep_loss_fn = PerceptualLoss(use_lpips=LPIPS_AVAILABLE)
         else:
             self.percep_loss_fn = None
+        self.st_percep_loss_fn = (
+            SpatiotemporalPerceptualLoss() if self.spatiotemporal_perceptual_weight > 0 else None
+        )
         self.register_buffer("imagenet_mean", torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1))
         self.register_buffer("imagenet_std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1))
 
@@ -167,11 +238,13 @@ class VideoLoss(nn.Module):
         
         pred_f32 = self._maybe_denormalize(pred.float())
         target_f32 = self._maybe_denormalize(target.float())
-        loss_recon_avg = F.l1_loss(pred_f32, target_f32)
+        diff = pred_f32 - target_f32
+        loss_recon_avg = torch.mean(torch.sqrt(diff * diff + self.charbonnier_eps * self.charbonnier_eps))
         loss_temp = torch.tensor(0.0, device=pred.device)
         loss_consistency = torch.tensor(0.0, device=pred.device)
         loss_percep = torch.tensor(0.0, device=pred.device)
         loss_temporal_percep = torch.tensor(0.0, device=pred.device)
+        loss_st_percep = torch.tensor(0.0, device=pred.device)
         loss_color = torch.tensor(0.0, device=pred.device)
         if pred_f32.size(1) > 1 and self.temp_weight > 0:
             pred_diff = pred_f32[:, 1:] - pred_f32[:, :-1]
@@ -202,12 +275,18 @@ class VideoLoss(nn.Module):
             pred_std = pred_f32.std(dim=(-2, -1), keepdim=True)
             target_std = target_f32.std(dim=(-2, -1), keepdim=True)
             loss_color = F.l1_loss(pred_mean, target_mean) + F.l1_loss(pred_std, target_std)
+        if self.st_percep_loss_fn is not None and self.spatiotemporal_perceptual_weight > 0:
+            try:
+                loss_st_percep = self.st_percep_loss_fn(pred_f32, target_f32)
+            except Exception:
+                loss_st_percep = torch.tensor(0.0, device=pred.device)
         total_loss = (
             (self.recon_weight * loss_recon_avg) +
             (self.temp_weight * loss_temp) +
             (self.consistency_weight * loss_consistency) +
             (self.percep_weight * loss_percep) +
             (self.temporal_perceptual_weight * loss_temporal_percep) +
+            (self.spatiotemporal_perceptual_weight * loss_st_percep) +
             (self.color_consistency_weight * loss_color)
         )
         return total_loss, {
@@ -216,6 +295,7 @@ class VideoLoss(nn.Module):
             'video_temporal_consistency_loss': loss_consistency.item(),
             'video_percep_loss': loss_percep.item(),
             'video_temporal_percep_loss': loss_temporal_percep.item(),
+            'video_st_percep_loss': loss_st_percep.item(),
             'video_color_consistency_loss': loss_color.item(),
         }
         #diff = pred -target
@@ -284,16 +364,23 @@ class AdversarialLoss(nn.Module):
     
     使用最小二乘GAN损失（LSGAN），比标准GAN损失更稳定。
     """
-    def __init__(self, target_real_label: float = 1.0, target_fake_label: float = 0.0):
+    def __init__(
+        self,
+        target_real_label: float = 1.0,
+        target_fake_label: float = 0.0,
+        gan_mode: str = 'hinge',
+    ):
         super().__init__()
         self.target_real_label = target_real_label
         self.target_fake_label = target_fake_label
         self.loss_fn = nn.MSELoss()
+        self.gan_mode = gan_mode
     
     def forward(
         self,
         discriminator_output: torch.Tensor,
-        target_is_real: bool
+        target_is_real: bool,
+        for_discriminator: bool = True,
     ) -> torch.Tensor:
         """
         计算对抗损失
@@ -305,13 +392,19 @@ class AdversarialLoss(nn.Module):
         Returns:
             torch.Tensor: 对抗损失值
         """
+        if self.gan_mode == 'hinge':
+            if for_discriminator:
+                if target_is_real:
+                    return torch.relu(1.0 - discriminator_output).mean()
+                return torch.relu(1.0 + discriminator_output).mean()
+            return -discriminator_output.mean()
+
+        # Legacy fallback: LSGAN
         if target_is_real:
             target = torch.full_like(discriminator_output, self.target_real_label)
         else:
             target = torch.full_like(discriminator_output, self.target_fake_label)
-        
-        loss = self.loss_fn(discriminator_output, target)
-        return loss
+        return self.loss_fn(discriminator_output, target)
 
 
 # --------------------------------------------------------------------------
@@ -320,12 +413,22 @@ class AdversarialLoss(nn.Module):
 
 
 class DepthLoss(nn.Module):
-    """深度重建损失：L1 + 边缘一致性。"""
+    """深度重建损失：SILog + 边缘一致性 + 法向一致性。"""
 
-    def __init__(self, l1_weight: float = 1.0, edge_weight: float = 0.1):
+    def __init__(
+        self,
+        silog_weight: float = 1.0,
+        edge_weight: float = 0.1,
+        normal_weight: float = 0.05,
+        silog_lambda: float = 0.85,
+        depth_eps: float = 1e-6,
+    ):
         super().__init__()
-        self.l1_weight = l1_weight
+        self.silog_weight = silog_weight
         self.edge_weight = edge_weight
+        self.normal_weight = normal_weight
+        self.silog_lambda = silog_lambda
+        self.depth_eps = depth_eps
 
     @staticmethod
     def _gradient_map(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -333,13 +436,41 @@ class DepthLoss(nn.Module):
         gy = x[..., 1:, :] - x[..., :-1, :]
         return gx, gy
 
+    def _silog_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred_safe = pred.clamp_min(self.depth_eps)
+        target_safe = target.clamp_min(self.depth_eps)
+        d = torch.log(pred_safe) - torch.log(target_safe)
+        mean_sq = (d * d).mean()
+        sq_mean = d.mean().pow(2)
+        silog_core = (mean_sq - self.silog_lambda * sq_mean).clamp_min(0.0)
+        return torch.sqrt(silog_core + self.depth_eps)
+
+    def _normal_map(self, depth: torch.Tensor) -> torch.Tensor:
+        gx, gy = self._gradient_map(depth)
+        # Align shapes to intersection region
+        gx = gx[..., :-1, :]
+        gy = gy[..., :, :-1]
+        nz = torch.ones_like(gx)
+        nx = -gx
+        ny = -gy
+        normal = torch.cat([nx, ny, nz], dim=1)
+        normal = F.normalize(normal, p=2, dim=1, eps=self.depth_eps)
+        return normal
+
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
-        l1 = F.l1_loss(pred, target)
+        silog = self._silog_loss(pred, target)
         gx_p, gy_p = self._gradient_map(pred)
         gx_t, gy_t = self._gradient_map(target)
         edge = F.l1_loss(gx_p, gx_t) + F.l1_loss(gy_p, gy_t)
-        total = self.l1_weight * l1 + self.edge_weight * edge
-        return total, {'depth_l1_loss': l1.item(), 'depth_edge_loss': edge.item()}
+        pred_n = self._normal_map(pred)
+        target_n = self._normal_map(target)
+        normal = (1.0 - (pred_n * target_n).sum(dim=1)).mean()
+        total = self.silog_weight * silog + self.edge_weight * edge + self.normal_weight * normal
+        return total, {
+            'depth_silog_loss': silog.item(),
+            'depth_edge_loss': edge.item(),
+            'depth_normal_loss': normal.item(),
+        }
 
 
 class DepthVideoLoss(nn.Module):
@@ -465,4 +596,3 @@ class DepthVideoLoss(nn.Module):
 
         loss_dict['total_loss'] = total
         return loss_dict
-
