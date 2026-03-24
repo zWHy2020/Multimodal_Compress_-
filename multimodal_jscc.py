@@ -2,7 +2,14 @@
 
 from modules.channel_models import BaseChannel, DefaultChannel
 from modules.depth_codec import DepthJSCCDecoder, DepthJSCCEncoder
-from modules.depth_models import BaseDepthDecoder, BaseDepthEncoder, DefaultDepthDecoder, DefaultDepthEncoder
+from modules.depth_models import (
+    BaseDepthDecoder,
+    BaseDepthEncoder,
+    DefaultDepthDecoder,
+    DefaultDepthEncoder,
+    ExternalDeepJSCCDepthDecoder,
+    ExternalDeepJSCCDepthEncoder,
+)
 from modules.fusion import JointEntropyModel, JointLatentFusion, MineEstimator
 from modules.fusion_models import (
     BaseEntropyModel,
@@ -27,6 +34,8 @@ __all__ = [
     'BaseDepthDecoder',
     'DefaultDepthEncoder',
     'DefaultDepthDecoder',
+    'ExternalDeepJSCCDepthEncoder',
+    'ExternalDeepJSCCDepthDecoder',
     'BaseVideoEncoder',
     'BaseVideoDecoder',
     'DefaultVideoEncoder',

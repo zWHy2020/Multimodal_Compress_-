@@ -26,6 +26,7 @@ from functools import partial
 
 # 导入模型和工具
 from multimodal_jscc import DepthVideoJSCC
+from modules.depth_models import ExternalDeepJSCCDepthDecoder, ExternalDeepJSCCDepthEncoder
 from losses import DepthVideoLoss
 from metrics import calculate_multimodal_metrics
 from data_loader import MultimodalDataLoader, MultimodalDataset, collate_multimodal_batch
@@ -44,6 +45,15 @@ def create_model(config: TrainingConfig) -> DepthVideoJSCC:
             #standard_depths = [2, 2, 6, 2]
             #standard_heads = [3, 6, 12, 24]
     """创建深度图+视频双模态JSCC模型"""
+    depth_method_id = getattr(config, "depth_method_id", "native_cnn")
+    depth_encoder = None
+    depth_decoder = None
+    if depth_method_id == "deepjscc_depth_adapted":
+        # keep latent channel compatibility: depth_output_dim ~= 2*c
+        c = max(1, int(getattr(config, "depth_output_dim", 128) // 2))
+        depth_encoder = ExternalDeepJSCCDepthEncoder(c=c)
+        depth_decoder = ExternalDeepJSCCDepthDecoder(c=c)
+
     model = DepthVideoJSCC(
         img_size=config.img_size,
         patch_size=config.patch_size,
@@ -58,6 +68,9 @@ def create_model(config: TrainingConfig) -> DepthVideoJSCC:
         enable_omib_stats=getattr(config, 'use_omib_like', True),
         enable_mi_correction=True,
         mine_hidden_dim=getattr(config, 'mine_hidden_dim', 128),
+        default_mode=getattr(config, 'model_mode', 'joint'),
+        depth_encoder=depth_encoder,
+        depth_decoder=depth_decoder,
     )
     return model
 
