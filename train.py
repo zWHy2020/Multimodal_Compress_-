@@ -58,6 +58,7 @@ def create_model(config: TrainingConfig) -> DepthVideoJSCC:
         enable_omib_stats=getattr(config, 'use_omib_like', True),
         enable_mi_correction=True,
         mine_hidden_dim=getattr(config, 'mine_hidden_dim', 128),
+        default_mode=getattr(config, 'model_mode', 'joint'),
     )
     return model
 

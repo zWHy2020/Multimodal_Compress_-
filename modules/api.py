@@ -27,6 +27,7 @@ class RateStats(TypedDict, total=False):
 
 
 class ModelForwardOutput(TypedDict, total=False):
+    mode: str
     depth_encoded: torch.Tensor
     video_encoded: torch.Tensor
     shared_latent: torch.Tensor
@@ -50,6 +51,7 @@ class ModelForwardAPI:
         depth_input: Optional[torch.Tensor],
         video_input: Optional[torch.Tensor],
         snr_db: Optional[float] = None,
+        mode: Optional[str] = None,
     ) -> ModelForwardOutput:
         raise NotImplementedError
 
