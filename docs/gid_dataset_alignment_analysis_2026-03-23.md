@@ -518,3 +518,68 @@ M4（对比层）：
 -（joint 时）`entropy_stats`、可选 `omib_stats`
 
 这对应你要求的“统一流程 + 模式可切换 + 可做联合/单模态对比”。
+
+## 12. 外部项目 Deep-JSCC-PyTorch 审查结论与接入方案
+
+审查对象：`https://github.com/chunbaobao/Deep-JSCC-PyTorch`
+
+### 12.1 能否“直接”用于 GID 深度图模态编码？
+
+结论：**不能直接无改动接入**，原因如下（基于项目源码）：
+1. 其编码器第一层写死 `in_channels=3`（RGB 输入）；  
+2. 解码器末层输出 `out_channels=3` + `Sigmoid`（RGB重建）；  
+3. 训练脚本数据流以 CIFAR10/ImageNet RGB 图像为目标，损失为图像 MSE。  
+
+因此它是“图像 RGB 单模态 JSCC”实现，不是“单通道深度图 JSCC”实现。若直接把 GID depth（1 通道）喂入会在输入通道维度上不匹配。
+
+### 12.2 论文与数学依据（为什么它可迁移但需适配）
+
+Deep JSCC 的核心是学习映射：
+\[
+x \xrightarrow{f_\theta} z \xrightarrow{\text{channel}} \tilde z \xrightarrow{g_\phi} \hat x
+\]
+并最小化失真 \(\mathbb{E}[d(x,\hat x)]\)（常用 MSE 或其变体）。
+
+该思想对“RGB 图像”与“深度图”都成立，因为两者都可视为二维连续信号；差别在于输入统计与损失定义（深度更适配 SILog/尺度相关项）。
+
+Deep-JSCC-PyTorch 代码中还实现了信道输入功率归一化（按潜变量能量归一），对应通信系统中平均功率约束思想。
+
+### 12.3 接入你本地仓库的具体方案（在“不可直接接入”前提下的最小改造）
+
+#### A. 封装为“可插拔单模态方法”
+新增适配器类（建议名 `ExternalDeepJSCCAdapter`）：
+- 输入：`[B,1,H,W]` depth（可选重复成3通道，或改外部模型首尾通道数）  
+- 输出：`depth_decoded`、可选 `rate_stats`（若无熵模型可先置空/占位）  
+
+#### B. 两条可行改造路线
+1. **结构改造路线（推荐）**  
+   直接把外部模型 `conv1 in_channels=3` 改为 1、末层输出改为 1；  
+   这样不引入伪彩色重复，保留深度单通道语义。  
+2. **输入适配路线（快速）**  
+   depth 复制 3 通道后喂入原模型，再对输出取单通道；  
+   工程快，但可能引入冗余耦合，不如结构改造干净。
+
+#### C. 与你当前框架的对接点
+1. 在 `modules/system.py` 的 `depth_only` / `joint` 路径中，把 depth 分支替换为适配器实例；  
+2. 在 `train.py` 增加 `depth_method_id`（如 `native_cnn`, `deep_jscc_external`）并在 `create_model` 中选择；  
+3. 损失层保持统一协议：  
+   \[
+   \mathcal{L}=\mathcal{L}_{RD}+\lambda_{inst}\mathcal{L}_{inst}+\lambda_{occ}\mathcal{L}_{occ}
+   \]
+   其中深度重建项可继续用你现有 `DepthLoss`（含 SILog/梯度/法向项）。
+
+#### D. 验证协议（与你目标一致）
+固定同一 GID split、同一 SNR、同一有效码率设置，报告：
+- `joint` vs `depth_only` vs `video_only`  
+- 全局深度指标 + instance-wise + occlusion-pair 指标  
+- 对比 `native depth codec` 与 `deep-jscc-adapted depth codec`
+
+### 12.4 参考链接（真实）
+- Deep JSCC 原论文（IEEE TWC 2019）：  
+  https://ieeexplore.ieee.org/abstract/document/8723589  
+- Deep-JSCC-PyTorch 仓库：  
+  https://github.com/chunbaobao/Deep-JSCC-PyTorch  
+- 神经压缩 RD 范式（Hyperprior）：  
+  https://arxiv.org/abs/1802.01436  
+- InstanceDepth（ICCV 2025）：  
+  https://openaccess.thecvf.com/content/ICCV2025/html/Liang_Instance-Level_Video_Depth_in_Groups_Beyond_Occlusions_ICCV_2025_paper.html
