@@ -470,3 +470,51 @@ M4（对比层）：
 并把第 5 列视为保留位，不参与训练损失与评测统计。
 
 这意味着前述实现方案已无关键语义阻塞，可直接进入代码落地阶段（M1→M4）。
+
+## 11. 修改后问题回答（按当前代码事实）
+
+### Q1. 目前模型包括“集成不同单模态 JSCC 方法”的功能吗？
+
+结论分两层：
+
+1) **系统层能力：部分具备**  
+`DepthVideoJSCC` 构造函数支持注入自定义 `depth_encoder/depth_decoder/video_encoder/video_decoder/channel/joint_fusion/entropy_model`，因此“替换单模态方法内核”在接口上是支持的。  
+
+2) **训练入口能力：尚未完全产品化**  
+当前 `train.py:create_model` 仍固定实例化 `DepthVideoJSCC(...)` 默认组件，没有“按方法ID/配置文件自动注册并切换不同单模态方法”的注册器逻辑。  
+也就是说：**可注入，但还不是“开箱即用的方法库切换”**。
+
+补充：本次已加入 `mode in {joint, depth_only, video_only}`，因此单模态与联合模式对照实验可直接运行。
+
+### Q2. 目前模型整体框架（输入→输出）流程梳理
+
+#### Step A: 数据输入层
+1. `data_loader.py` 读取样本：
+   - 深度：`depth.file` → 单通道张量；  
+   - 视频：`video.file` 可是**帧目录**（GID）或**视频文件**（legacy）；  
+   - 统一 `collate` 形成 `inputs = {depth_input, video_input, video_frame_mask}`。  
+2. `benchmark/data/gid_dataset.py`（基准读取器）可读：
+   - RGB: jpg/png  
+   - 深度: aligned_depths  
+   - mask: `<stem>.png` 或 `<stem>-instance.png`  
+   - box2d: `<video>.json`（可选）
+
+#### Step B: 模型编排层（`modules/system.py`）
+按 `mode` 分流：
+- `joint`：深度编码 + 视频编码 → 融合(shared/private) → 熵估计 → 信道 → 解码；  
+- `depth_only`：仅深度编码/信道/解码；  
+- `video_only`：仅视频编码/信道/解码。  
+
+#### Step C: 损失与指标层
+1. `losses.py::DepthVideoLoss` 汇总：
+   - depth 重建项、video 重建项、rate 项、可选 OMIB-like 正则。  
+2. `metrics.py::calculate_multimodal_metrics` 统一输出评测指标。  
+
+#### Step D: 输出
+模型输出 `ModelForwardOutput`，包括（按模式可能子集）：
+- `depth_decoded` / `video_decoded`  
+- `rate_stats`  
+- `mode`  
+-（joint 时）`entropy_stats`、可选 `omib_stats`
+
+这对应你要求的“统一流程 + 模式可切换 + 可做联合/单模态对比”。
