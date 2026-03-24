@@ -213,52 +213,76 @@ class MultimodalDataset(Dataset):
 
     def _load_video_frames(self, video_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
         full_path = os.path.join(self.data_dir, video_path)
-        cap = cv2.VideoCapture(full_path)
-        if not cap.isOpened():
-            raise FileNotFoundError(f"无法打开视频: {full_path}")
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total_frames <= 0:
-            # CAP_PROP_FRAME_COUNT 可能不可用，顺序计数
-            total_frames = 0
-            while True:
-                ret, _ = cap.read()
-                if not ret:
-                    break
-                total_frames += 1
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         strategy = self._resolve_video_sampling_strategy()
-        target_indices, true_frames = self._select_video_indices(total_frames, strategy)
-        if true_frames <= 0:
-            cap.release()
-            raise RuntimeError(f"视频为空: {full_path}")
         frames: List[Image.Image] = []
-        if (
-            strategy in {"contiguous_clip", "fixed_start"}
-            and total_frames >= self.video_clip_len
-            and self.video_stride == 1
-        ):
-            start = target_indices[0]
-            if start > 0:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-            for _ in range(self.video_clip_len):
-                ret, frame = cap.read()
-                if not ret:
+
+        # GID-like: path points to a frame directory.
+        if os.path.isdir(full_path):
+            frame_files = []
+            for ext in ("*.jpg", "*.jpeg", "*.png"):
+                frame_files.extend(sorted(os.path.join(full_path, f) for f in os.listdir(full_path) if f.lower().endswith(ext[1:])))
+            # fallback for case-sensitive / mixed extensions
+            if not frame_files:
+                frame_files = sorted(
+                    os.path.join(full_path, f)
+                    for f in os.listdir(full_path)
+                    if f.lower().endswith((".jpg", ".jpeg", ".png"))
+                )
+            total_frames = len(frame_files)
+            target_indices, true_frames = self._select_video_indices(total_frames, strategy)
+            if true_frames <= 0:
+                raise RuntimeError(f"视频帧目录为空: {full_path}")
+            for idx in target_indices:
+                if idx >= total_frames:
                     break
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(Image.fromarray(frame_rgb))
+                frame_path = frame_files[idx]
+                frames.append(Image.open(frame_path).convert("RGB"))
         else:
-            current_idx = 0
-            target_ptr = 0
-            while target_ptr < len(target_indices):
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if current_idx == target_indices[target_ptr]:
+            # Legacy: single video file path.
+            cap = cv2.VideoCapture(full_path)
+            if not cap.isOpened():
+                raise FileNotFoundError(f"无法打开视频: {full_path}")
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames <= 0:
+                # CAP_PROP_FRAME_COUNT 可能不可用，顺序计数
+                total_frames = 0
+                while True:
+                    ret, _ = cap.read()
+                    if not ret:
+                        break
+                    total_frames += 1
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            target_indices, true_frames = self._select_video_indices(total_frames, strategy)
+            if true_frames <= 0:
+                cap.release()
+                raise RuntimeError(f"视频为空: {full_path}")
+            if (
+                strategy in {"contiguous_clip", "fixed_start"}
+                and total_frames >= self.video_clip_len
+                and self.video_stride == 1
+            ):
+                start = target_indices[0]
+                if start > 0:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+                for _ in range(self.video_clip_len):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     frames.append(Image.fromarray(frame_rgb))
-                    target_ptr += 1
-                current_idx += 1
-        cap.release()
+            else:
+                current_idx = 0
+                target_ptr = 0
+                while target_ptr < len(target_indices):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    if current_idx == target_indices[target_ptr]:
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        frames.append(Image.fromarray(frame_rgb))
+                        target_ptr += 1
+                    current_idx += 1
+            cap.release()
         if not frames:
             raise RuntimeError(f"未能读取任何帧: {full_path}")
         true_frames = len(frames)

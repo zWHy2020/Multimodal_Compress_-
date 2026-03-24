@@ -40,6 +40,7 @@ class DepthVideoJSCC(nn.Module):
         omib_eps: float = 1e-6,
         enable_mi_correction: bool = True,
         mine_hidden_dim: int = 128,
+        default_mode: str = "joint",
         depth_encoder: Optional[BaseDepthEncoder] = None,
         depth_decoder: Optional[BaseDepthDecoder] = None,
         video_encoder: Optional[BaseVideoEncoder] = None,
@@ -74,6 +75,7 @@ class DepthVideoJSCC(nn.Module):
         self.enable_omib_stats = bool(enable_omib_stats)
         self.omib_eps = float(omib_eps)
         self.enable_mi_correction = bool(enable_mi_correction)
+        self.default_mode = str(default_mode)
         self.mine_estimator = (
             mine_estimator or DefaultMineEstimator(depth_output_dim, video_output_dim, hidden_dim=mine_hidden_dim)
         ) if self.enable_mi_correction else None
@@ -102,13 +104,58 @@ class DepthVideoJSCC(nn.Module):
         depth_input: Optional[torch.Tensor] = None,
         video_input: Optional[torch.Tensor] = None,
         snr_db: Optional[float] = None,
+        mode: Optional[str] = None,
     ) -> ModelForwardOutput:
         if snr_db is not None:
             self.channel.set_snr(snr_db)
 
         out: ModelForwardOutput = {}
-        if depth_input is None or video_input is None:
+        active_mode = (mode or self.default_mode or "joint").lower()
+        if active_mode not in {"joint", "depth_only", "video_only"}:
+            raise ValueError(f"Unsupported mode={active_mode}, expect joint/depth_only/video_only")
+
+        if active_mode == "joint" and (depth_input is None or video_input is None):
             raise RuntimeError('DepthVideoJSCC 联合压缩需要同时输入 depth_input 和 video_input。')
+        if active_mode == "depth_only" and depth_input is None:
+            raise RuntimeError('DepthVideoJSCC depth_only 需要 depth_input。')
+        if active_mode == "video_only" and video_input is None:
+            raise RuntimeError('DepthVideoJSCC video_only 需要 video_input。')
+
+        out["mode"] = active_mode
+
+        if active_mode == "depth_only":
+            depth_encoded, depth_guide = self.depth_encoder(depth_input)
+            depth_tx = self.channel(self._norm_feature(depth_encoded, 'depth'))
+            out['depth_encoded'] = depth_encoded
+            out['depth_private_transmitted'] = depth_tx
+            out['depth_decoded'] = self.depth_decoder(depth_tx, depth_guide)
+            zero = depth_tx.new_zeros(())
+            out['rate_stats'] = {
+                'joint_bpe': zero,
+                'shared_bpe': zero,
+                'depth_private_bpe': zero,
+                'video_private_bpe': zero,
+            }
+            return out
+
+        if active_mode == "video_only":
+            video_encoded, video_guide = self.video_encoder(video_input)
+            video_tx = self.channel(self._norm_feature(video_encoded, 'video'))
+            out['video_encoded'] = video_encoded
+            out['video_private_transmitted'] = video_tx
+            out['video_decoded'] = self.video_decoder(
+                video_tx,
+                video_guide,
+                output_size=getattr(self.video_encoder, 'last_input_size', None),
+            )
+            zero = video_tx.new_zeros(())
+            out['rate_stats'] = {
+                'joint_bpe': zero,
+                'shared_bpe': zero,
+                'depth_private_bpe': zero,
+                'video_private_bpe': zero,
+            }
+            return out
 
         depth_encoded, depth_guide = self.depth_encoder(depth_input)
         video_encoded, video_guide = self.video_encoder(video_input)
