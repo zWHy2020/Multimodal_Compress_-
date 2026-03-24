@@ -663,3 +663,33 @@ M4（评测侧）：
   https://arxiv.org/abs/1802.01436  
 - InstanceDepth（ICCV 2025）：  
   https://openaccess.thecvf.com/content/ICCV2025/html/Liang_Instance-Level_Video_Depth_in_Groups_Beyond_Occlusions_ICCV_2025_paper.html
+
+### 13.7 已落地的最小代码实现（本仓库）
+
+已完成以下程序化改造：
+1. 新增 `modules/depth_deepjscc.py`：提供单通道结构改造版 DeepJSCC depth encoder/decoder（1->1）。  
+   该实现按外部仓库 `model.py` 的网络骨架与归一化流程进行对齐，仅改输入/输出通道数。  
+2. 在 `modules/depth_models.py` 增加  
+   `ExternalDeepJSCCDepthEncoder/Decoder` 封装类。  
+3. 在 `train.py:create_model` 增加 `depth_method_id` 选择：
+   - `native_cnn`（默认）  
+   - `deepjscc_depth_adapted`（结构改造版）  
+4. 在 `config.py` 增加 `depth_method_id` 默认配置项。  
+
+这实现了“结构改造路线”的第一步：无需改动主系统前向接口即可切换深度分支实现。
+
+## 14. 集成状态声明（针对“是否已效仿 UnSSR 完成即插即用集成”）
+
+结论：**已完成“可切换接入”，但尚未完成 UnSSR 风格的完整方法注册中心。**
+
+### 已完成
+1. Deep-JSCC 深度分支结构改造（1ch->1ch）已落地。  
+2. 在训练入口通过 `depth_method_id` 可切换到 `deepjscc_depth_adapted`。  
+3. 该分支可在现有 `joint/depth_only/video_only` 模式中运行。  
+
+### 尚未完成（仍在规划）
+1. 类似 UnSSR 的“统一 methods registry + 多方法清单自动注册/发现”机制。  
+2. `video_method_id` 对称注册与统一方法目录规范（当前仅 depth 分支实现了方法切换入口）。  
+
+因此，如果问题是“是否已经把 DeepJSCC 作为本地仓库可切换的单模态方法之一接入”，答案是**是（已接入 depth 分支）**；  
+如果问题是“是否已经完全按 UnSSR 方式做完方法库级即插即用体系”，答案是**还没有完全做完**。

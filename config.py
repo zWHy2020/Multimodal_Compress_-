@@ -93,6 +93,7 @@ class TrainingConfig:
         self.video_entropy_quantile_sample_size = 262_144
         self.channel_type = "awgn"
         self.model_mode = "joint"
+        self.depth_method_id = "native_cnn"  # native_cnn | deepjscc_depth_adapted
 
         # data
         self.data_dir = None

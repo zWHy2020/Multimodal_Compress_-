@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from .depth_codec import DepthJSCCDecoder, DepthJSCCEncoder
+from .depth_deepjscc import DeepJSCCDepthDecoder, DeepJSCCDepthEncoder
 
 
 class BaseDepthEncoder(nn.Module, ABC):
@@ -44,6 +45,28 @@ class DefaultDepthDecoder(BaseDepthDecoder):
     def __init__(self, input_dim: int = 128):
         super().__init__()
         self.impl = DepthJSCCDecoder(input_dim=input_dim)
+
+    def forward(self, encoded: torch.Tensor, guide: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.impl(encoded, guide)
+
+
+class ExternalDeepJSCCDepthEncoder(BaseDepthEncoder):
+    """External DeepJSCC-style encoder adapted for single-channel depth."""
+
+    def __init__(self, c: int = 64, power_constraint: float = 1.0):
+        super().__init__()
+        self.impl = DeepJSCCDepthEncoder(c=c, power_constraint=power_constraint)
+
+    def forward(self, depth_input: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return self.impl(depth_input)
+
+
+class ExternalDeepJSCCDepthDecoder(BaseDepthDecoder):
+    """External DeepJSCC-style decoder adapted for single-channel depth."""
+
+    def __init__(self, c: int = 64):
+        super().__init__()
+        self.impl = DeepJSCCDepthDecoder(c=c)
 
     def forward(self, encoded: torch.Tensor, guide: Optional[torch.Tensor] = None) -> torch.Tensor:
         return self.impl(encoded, guide)
