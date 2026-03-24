@@ -1,15 +1,17 @@
 """GID dataset reader for unified JSCC benchmark.
 
 Expected layout:
-- images/<video_name>/*.jpg
+- images/<video_name>/*.(jpg|png)
 - aligned_depths/<video_name>/*.png
-- (optional) instance-masks/<video_name>/*-instance.png
+- (optional) instance-masks/<video_name>/*-instance.png or <frame>.png
+- (optional) box2d/<video_name>.json
 - video-train.txt, video-test.txt
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Dict, List, Literal
 
@@ -27,6 +29,7 @@ class GIDSample:
     rgb_path: Path
     depth_path: Path
     mask_path: Path | None
+    frame_box2d: List[List[float]] | None
 
 
 class GIDFramePairDataset(Dataset):
@@ -44,11 +47,14 @@ class GIDFramePairDataset(Dataset):
         image_size: tuple[int, int] = (224, 224),
         depth_scale_m: float = 10.0,
         use_instance_masks: bool = False,
+        use_box2d: bool = False,
     ) -> None:
         self.root = Path(root)
         self.split = split
         self.depth_scale_m = depth_scale_m
         self.use_instance_masks = use_instance_masks
+        self.use_box2d = use_box2d
+        self.box2d_root = self.root / "box2d"
 
         self.rgb_tf = transforms.Compose([
             transforms.Resize(image_size),
@@ -59,6 +65,7 @@ class GIDFramePairDataset(Dataset):
             transforms.ToTensor(),
         ])
 
+        self._box2d_cache = self._load_box2d_cache()
         self.samples = self._index_samples()
         if not self.samples:
             raise RuntimeError(f"No paired samples found for split={split} under {root}")
@@ -81,12 +88,18 @@ class GIDFramePairDataset(Dataset):
             if not rgb_dir.exists() or not depth_dir.exists():
                 continue
 
-            for rgb_path in sorted(rgb_dir.glob("*.jpg")):
+            rgb_paths = sorted(rgb_dir.glob("*.jpg")) + sorted(rgb_dir.glob("*.png"))
+            for rgb_path in sorted(rgb_paths):
                 stem = rgb_path.stem
                 depth_path = depth_dir / f"{stem}.png"
                 if not depth_path.exists():
                     continue
-                mask_path = mask_dir / f"{stem}-instance.png"
+                mask_path = mask_dir / f"{stem}.png"
+                if not mask_path.exists():
+                    mask_path = mask_dir / f"{stem}-instance.png"
+                frame_box2d = None
+                if self.use_box2d:
+                    frame_box2d = self._box2d_cache.get(video_name, {}).get(stem)
                 samples.append(
                     GIDSample(
                         video_name=video_name,
@@ -94,9 +107,25 @@ class GIDFramePairDataset(Dataset):
                         rgb_path=rgb_path,
                         depth_path=depth_path,
                         mask_path=mask_path if mask_path.exists() else None,
+                        frame_box2d=frame_box2d,
                     )
                 )
         return samples
+
+    def _load_box2d_cache(self) -> Dict[str, Dict[str, List[List[float]]]]:
+        if not self.use_box2d:
+            return {}
+        cache: Dict[str, Dict[str, List[List[float]]]] = {}
+        if not self.box2d_root.exists():
+            return cache
+        for p in sorted(self.box2d_root.glob("*.json")):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                cache[p.stem] = data
+        return cache
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -128,5 +157,9 @@ class GIDFramePairDataset(Dataset):
                 mask_np = np.array(mask_raw, dtype=np.int64)
                 mask = torch.from_numpy(mask_np).unsqueeze(0)
             out["instance_mask"] = mask
+
+        if self.use_box2d:
+            boxes = s.frame_box2d if s.frame_box2d is not None else []
+            out["box2d"] = torch.tensor(boxes, dtype=torch.float32)
 
         return out
